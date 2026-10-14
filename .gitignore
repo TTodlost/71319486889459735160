@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+replays/
+replay-state.tar.gz
+!bootstrap/replay-state.tar.gz
+*.part

@@ -1,0 +1,111 @@
+name: Replay archive
+
+on:
+  schedule:
+    - cron: '2-57/5 * * * *'
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: 'Recover from the checked-in seed ONLY if no live snapshot exists (loses later progress)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.11'
+      - run: python -m unittest discover -s reconstruction/tests -p 'test_*.py' -v
+
+  sync:
+    needs: test
+    # A PR or a dispatch on another branch must never replace the archive.
+    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped') && github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write
+    concurrency:
+      group: battlecode-replay-archive
+      cancel-in-progress: false
+    env:
+      ARCHIVE_DIR: replays/website
+      SNAPSHOT_FILE: replay-state.tar.gz
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.11'
+
+      - name: Restore the latest verified archive
+        id: restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALLOW_BOOTSTRAP: ${{ (github.run_number == 1 && github.event_name == 'push') || (github.event_name == 'workflow_dispatch' && inputs.bootstrap) }}
+        run: |
+          bootstrap_args=()
+          if [[ "$ALLOW_BOOTSTRAP" == "true" ]]; then
+            bootstrap_args+=(--bootstrap --seed bootstrap/replay-state.tar.gz)
+          fi
+          python reconstruction/tools/github_replay_state.py restore \
+            --branch "$DEFAULT_BRANCH" --outdir "$ARCHIVE_DIR" \
+            --snapshot "$SNAPSHOT_FILE" "${bootstrap_args[@]}"
+
+      - name: Fetch a bounded batch
+        id: sync
+        continue-on-error: true
+        run: |
+          python reconstruction/tools/github_replay_state.py run \
+            --outdir "$ARCHIVE_DIR" --seconds 180 \
+            --max-pages 20 --max-details 40 --max-downloads 100
+
+      - name: Pack the catalog and replay files
+        id: pack
+        if: always() && !cancelled() && steps.restore.outcome == 'success'
+        run: |
+          python reconstruction/tools/replay_snapshot.py pack \
+            --outdir "$ARCHIVE_DIR" --snapshot "$SNAPSHOT_FILE"
+
+      - name: Persist progress
+        id: upload
+        if: always() && !cancelled() && steps.pack.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: battlecode-replay-state-${{ github.run_id }}-${{ github.run_attempt }}
+          path: replay-state.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
+      - name: Keep the two newest snapshots
+        if: always() && !cancelled() && steps.upload.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPLOADED_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          python reconstruction/tools/github_replay_state.py prune \
+            --branch "$DEFAULT_BRANCH" --uploaded-id "$UPLOADED_ID" --keep 2
+
+      - name: Report an interrupted or failed fetch
+        if: always() && !cancelled() && steps.sync.outcome == 'failure'
+        run: |
+          echo 'Fetch did not finish cleanly. Check the persistence steps above; saved checkpoints resume next run.'
+          exit 1
