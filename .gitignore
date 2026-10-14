@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+README.md
 replays/
 replay-state.tar.gz
 !bootstrap/replay-state.tar.gz
