@@ -10,12 +10,19 @@ One-time repository setup: open **Settings → Pages → Build and deployment**,
 The workflow uses the built-in token; no personal token, SSH key, or credentials
 are included in the public website.
 
-GitHub Pages serves static files. Python runs in Actions to download the newest
-verified replay snapshot, repair historical Elo through individual team histories,
-and validate purchases against official match statistics. The browser calculates
+GitHub Pages serves static files. Python runs in Actions to read the current
+leaderboard, fetch each current top-20 team's latest 25 completed ranked series
+within 24 hours, and validate replay purchases against official match statistics.
+Per-team histories avoid the global archive's unfinished backfill and timestamp
+pagination gaps. Series shared by two leaders are downloaded and counted once.
+The browser calculates
 filterable champion, item, synergy, and matchup statistics from the published data.
 The Reload button checks the latest published dataset; archive collection and
-deployment timing depend on GitHub Actions scheduling.
+deployment timing depend on GitHub Actions scheduling. The page shows the actual
+match span, leaderboard snapshot time, collection cap, and build time separately.
+Each build queries the current leaderboard and recent histories even when the
+archive artifact has not changed. Current replay files and decoded purchases are
+cached between builds; old archive progress cannot block fresh statistics.
 
 ## Metrics
 
@@ -34,8 +41,13 @@ deployment timing depend on GitHub Actions scheduling.
   Opponent matchups compare observed win rate with the mean of the hero's baseline
   and the complement of its opponent's baseline. Samples and correlations matter;
   these figures do not prove that a pairing or item caused the result.
-- Historical ranks cover the observed public team universe. The archive is partial,
-  and maps from the same team/series are correlated.
+- Top N means the team's rank on the current published leaderboard snapshot,
+  regardless of its rank when the match was played. N is limited to the collected
+  top 20. “Both teams” requires two current members; “At least one” counts only
+  qualifying teams' observations. Queue filters reflect the available ranked sample.
+- This is a capped recent sample, not all games in 24 hours. Teams may have fewer
+  than 25 eligible series. Only completed maps with usable replay statistics are
+  included; maps from the same team/series are correlated.
 
 ## Local checks
 

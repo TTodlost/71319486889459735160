@@ -5,7 +5,7 @@ import {readFileSync, existsSync} from 'node:fs';
 import {execFileSync} from 'node:child_process';
 
 const require = createRequire(import.meta.url);
-const {aggregate, validateDataset} = require('./web/stats.js');
+const {aggregate, validateDataset, snapshotCoverage} = require('./web/stats.js');
 const {createSnapshotSource} = require('./web/snapshot.js');
 const champion = (type = 5, items = {}, bought = {}, late = {}) => {
   const values = entries => Array.from({length: 2}, (_, i) => entries[i] || 0);
@@ -13,7 +13,8 @@ const champion = (type = 5, items = {}, bought = {}, late = {}) => {
     lateItemBuys: values(late), consumablesBought: [1, 0, 0, 0], lateConsumableBuys: [0, 0, 0, 0], spentGold: 150};
 };
 const team = (id, rank, win, champions, eloDelta) => ({id, name: id, rank, rankMin: rank, rankMax: rank, elo: 1700 - rank, verified: true, win, champions, eloDelta});
-const fixture = () => ({meta: {}, champions: [{id: 5, name: 'Stellar'}, {id: 3, name: 'Cassi'}, {id: 4, name: 'Issac'}],
+const fixture = () => ({meta: {}, leaderboard: [{teamId: 'a', rank: 1, rating: 1699, name: 'a'}, {teamId: 'b', rank: 2, rating: 1698, name: 'b'}, {teamId: 'c', rank: 40, rating: 1660, name: 'c'}],
+  champions: [{id: 5, name: 'Stellar'}, {id: 3, name: 'Cassi'}, {id: 4, name: 'Issac'}],
   items: [{id: 0, name: 'Power Shard Of Focus', purchasable: true}, {id: 1, name: 'Power Emblem Of Focus', purchasable: false}],
   matches: [
     {id: 'mirror', url: 'https://example.com/mirror', map: 'collision', kind: 'ranked', startedAt: '2026-10-14T08:00:00Z', rounds: 500, seriesMaps: 2,
@@ -46,7 +47,7 @@ test('direct buys exclude combines; item win rate retains both outcomes', () => 
   assert.equal(winning.items.find(row => row.id === 1).finalRate, 100);
 });
 
-test('either cohort counts only qualifying sides; rank uncertainty excludes membership', () => {
+test('either cohort counts only current qualifying sides, regardless of historical uncertainty', () => {
   const result = aggregate(fixture(), {cohort: 'either'});
   assert.equal(result.summary.games, 2);
   assert.equal(result.summary.teamObservations, 3);
@@ -54,9 +55,29 @@ test('either cohort counts only qualifying sides; rank uncertainty excludes memb
   assert.ok(!result.teamRows.some(row => row.id === 'c'));
   const data = fixture();
   data.matches[0].teams[0].rankMax = 21;
-  assert.equal(aggregate(data).summary.games, 0);
   data.matches[0].teams[0].verified = false;
+  assert.equal(aggregate(data).summary.games, 1);
+  data.leaderboard[0].rank = 21;
   assert.equal(aggregate(data).summary.games, 0);
+});
+
+const changedLeaderboardFixture = () => {
+  const data = fixture();
+  data.leaderboard[1].rank = 40;
+  data.leaderboard[2].rank = 2;
+  data.matches[1].teams[0].verified = false;
+  return data;
+};
+
+test('a current promotion selects a historically low-ranked team, and a current demotion excludes one', () => {
+  const result = aggregate(changedLeaderboardFixture());
+  assert.deepEqual([result.summary.games, result.summary.teamObservations, result.recentMatches[0].id], [1, 2, 'mixed']);
+  assert.equal(result.teamRows.find(row => row.id === 'c').currentRank, 2);
+  assert.equal(result.recentMatches[0].teams[1].rank, 40);
+  assert.equal(result.recentMatches[0].teams[1].currentRank, 2);
+  const data = fixture();
+  data.leaderboard = [];
+  assert.equal(aggregate(data, {cohort: 'either'}).summary.games, 0);
 });
 
 test('filters compose and empty samples use null rates', () => {
@@ -112,16 +133,41 @@ test('query validation and input immutability', () => {
   invalid.matches[0].teams[0].champions[0].rawItemBuys = [];
   assert.throws(() => validateDataset(invalid));
   assert.throws(() => validateDataset({meta: {}, matches: []}));
+  for (const leaderboard of [undefined, {}, [{teamId: 'a', rank: true}], [{teamId: 'a', rank: 0}], [{teamId: 'a', rank: 1}, {teamId: 'a', rank: 2}]]) {
+    const invalid = fixture();
+    invalid.leaderboard = leaderboard;
+    assert.throws(() => validateDataset(invalid), /Current leaderboard/);
+    assert.throws(() => aggregate(invalid), /Current leaderboard/);
+  }
+  const capped = fixture();
+  capped.meta.collectionTop = 20;
+  assert.throws(() => aggregate(capped, {top: '21'}), /current top 20/);
 });
 
-test('optional parity with the independently implemented Python aggregation and local archive', {skip: !process.env.TRACKER_PARITY_DIR}, () => {
+test('match freshness stays separate from leaderboard, artifact and build dates', () => {
+  const data = fixture();
+  data.meta = {leaderboardUpdatedAt: '2026-10-15T18:00:00Z', updatedAt: '2026-10-15T18:10:00Z', artifactCreatedAt: '2026-10-15T18:05:00Z',
+    sampleStartAt: '2026-10-14T18:00:00Z', sampleEndAt: '2026-10-15T18:00:00Z', sampleWindowHours: 24, collectionTop: 20, seriesPerTeam: 25};
+  const coverage = snapshotCoverage(data);
+  assert.equal(coverage.latestMatchAt, '2026-10-14T08:20:00Z');
+  assert.equal(coverage.leaderboardUpdatedAt, '2026-10-15T18:00:00Z');
+  assert.equal(coverage.builtAt, '2026-10-15T18:10:00Z');
+  assert.equal(coverage.artifactCreatedAt, '2026-10-15T18:05:00Z');
+  assert.equal(coverage.windowHours, 24);
+});
+
+test('optional parity with Python for current-rank regressions and an available local archive', {skip: !process.env.TRACKER_PARITY_DIR}, () => {
   const directory = process.env.TRACKER_PARITY_DIR;
-  const archive = JSON.parse(readFileSync(new URL('data.json', `file:///${directory.replaceAll('\\', '/')}/`), 'utf8'));
-  validateDataset(archive);
+  const path = process.env.TRACKER_PARITY_DATA || new URL('data.json', `file:///${directory.replaceAll('\\', '/')}/`);
+  const archive = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : null;
+  if (archive) validateDataset(archive);
+  const target = archive || fixture();
+  const limit = String(target.meta.collectionTop || 10000);
   const queries = [{}, {cohort: 'either'}, {top: '10000', kind: 'all', outcome: 'all'}, {champion: '5'}, {champion: '3', outcome: 'losses'},
-    {top: '1', cohort: 'either'}, {kind: 'unranked'}, {map: archive.matches[0].map, cohort: 'either'},
-    {top: '10000', team: archive.matches[0].teams[0].id, kind: 'all'}, {map: 'missing'}, {minGames: '0'}, {minGames: '10000'}];
-  const samples = [fixture(), archive];
+    {top: '1', cohort: 'either'}, {kind: 'unranked'}, {map: target.matches[0]?.map || 'collision', cohort: 'either'},
+    {top: limit, team: target.matches[0]?.teams[0].id || 'a', kind: 'all'}, {map: 'missing'}, {minGames: '0'}, {minGames: '10000'}];
+  queries[2].top = limit;
+  const samples = [fixture(), changedLeaderboardFixture(), ...(archive ? [archive] : [])];
   const python = 'import sys,json;sys.path.insert(0,sys.argv[1]);import app;p=json.load(sys.stdin);json.dump([[app.aggregate(d,q) for q in p["queries"]] for d in p["samples"]],sys.stdout,allow_nan=False)';
   const expected = JSON.parse(execFileSync(process.env.TRACKER_PARITY_PYTHON || 'python', ['-c', python, directory], {
     input: JSON.stringify({samples, queries}), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,

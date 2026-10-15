@@ -23,11 +23,34 @@ def percentage(numerator, denominator):
     return 100 * numerator / denominator if denominator else None
 
 
+def current_leaderboard(data):
+    rows = data.get('leaderboard')
+    if not isinstance(rows, list):
+        raise ValueError('Current leaderboard snapshot is unavailable')
+    result = {}
+    for row in rows:
+        if (not isinstance(row, dict) or not isinstance(row.get('teamId'), str)
+                or type(row.get('rank')) is not int or row['rank'] < 1
+                or row['teamId'] in result):
+            raise ValueError('Current leaderboard snapshot is invalid')
+        rating = row.get('rating')
+        if rating is not None and (type(rating) not in (int, float) or not math.isfinite(rating)):
+            raise ValueError('Current leaderboard snapshot is invalid')
+        if 'name' in row and not isinstance(row['name'], str):
+            raise ValueError('Current leaderboard snapshot is invalid')
+        result[row['teamId']] = row
+    return result
+
+
 def aggregate(data, query=None):
     q = query or {}
     top = int(q.get('top', '20'))
     if not 1 <= top <= 10000:
         raise ValueError('top must be between 1 and 10000')
+    collection_top = data.get('meta', {}).get('collectionTop')
+    if type(collection_top) is int and collection_top > 0 and top > collection_top:
+        raise ValueError(f'This snapshot collects replays for only the current top {collection_top} teams')
+    leaderboard = current_leaderboard(data)
     minimum = q.get('minGames', '10')
     if type(minimum) not in (int, str):
         raise ValueError('minGames must be an integer between 0 and 10000')
@@ -55,7 +78,7 @@ def aggregate(data, query=None):
             continue
         if filters['map'] != 'all' and match['map'] != filters['map']:
             continue
-        eligible = [t for t in match['teams'] if t['verified'] and t['rankMax'] <= top]
+        eligible = [t for t in match['teams'] if t['id'] in leaderboard and leaderboard[t['id']]['rank'] <= top]
         if (filters['cohort'] == 'both' and len(eligible) != 2) or not eligible:
             continue
         if filters['team'] != 'all':
@@ -167,7 +190,8 @@ def aggregate(data, query=None):
     teams = defaultdict(list)
     for _, t in observations:
         teams[t['id']].append(t)
-    team_rows = [{'id': tid, 'name': values[0]['name'], 'games': len(values),
+    team_rows = [{'id': tid, 'name': leaderboard[tid].get('name', values[0]['name']), 'games': len(values),
+                  'currentRank': leaderboard[tid]['rank'], 'currentElo': leaderboard[tid].get('rating'),
                   'wins': sum(t['win'] for t in values), 'winRate': percentage(sum(t['win'] for t in values), len(values))}
                  for tid, values in teams.items()]
     team_rows.sort(key=lambda row: (-row['games'], row['name']))
@@ -176,7 +200,11 @@ def aggregate(data, query=None):
         recent.append({k: match[k] for k in ('id', 'url', 'map', 'startedAt', 'rounds')})
         recent[-1]['teams'] = [{k: t[k] for k in ('name', 'rank', 'rankMin', 'rankMax', 'elo', 'win')}
                                for t in match['teams']]
+        for source, team in zip(match['teams'], recent[-1]['teams']):
+            current = leaderboard.get(source['id'], {})
+            team.update(currentRank=current.get('rank'), currentElo=current.get('rating'))
     all_teams = {t['id']: t['name'] for m in data['matches'] for t in m['teams']}
+    all_teams.update((tid, row['name']) for tid, row in leaderboard.items() if 'name' in row)
     selected_name = next((c['name'] for c in data['champions'] if str(c['id']) == filters['champion']), 'All champions')
     return {'meta': data['meta'], 'filters': filters,
         'summary': {'games': len(games), 'teamObservations': len(observations), 'uniqueTeams': len(teams),

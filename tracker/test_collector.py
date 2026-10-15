@@ -8,6 +8,57 @@ import collector
 
 
 class RefreshRecoveryTests(unittest.TestCase):
+    def test_current_sample_pages_from_head_and_caps_completed_series(self):
+        def group(name, created, status='finished', rated=True):
+            return {'id': name, 'createdAt': created, 'kind': 'ranked', 'status': status,
+                    'ratedAt': created if rated else None}
+
+        pages = [
+            {'groups': [group('future', '2026-10-15T13:00:00.000Z'),
+                        group('pending', '2026-10-15T11:59:00.000Z', rated=False),
+                        group('a', '2026-10-15T11:50:00.000Z')], 'more': True},
+            {'groups': [group('a', '2026-10-15T11:50:00.000Z'),
+                        group('b', '2026-10-15T11:40:00.000Z'),
+                        group('c', '2026-10-15T11:30:00.000Z')], 'more': True}]
+        calls = []
+
+        class FakeClient:
+            def get_json(self, endpoint, params):
+                calls.append(dict(params))
+                return pages.pop(0)
+
+        result = collector.recent_groups(FakeClient(), 'team', '2026-10-14T12:00:00.000Z',
+                                         '2026-10-15T12:00:00.000Z', limit=2)
+        self.assertEqual([g['id'] for g in result], ['a', 'b'])
+        self.assertEqual(calls[0]['before'], '2026-10-15T12:00:00.000Z_ffffffff-ffff-ffff-ffff-ffffffffffff')
+        self.assertEqual(calls[1]['before'], '2026-10-15T11:50:00.000Z_a')
+        self.assertEqual(calls[0]['team'], 'team')
+
+    def test_current_sample_stops_at_window_and_rejects_broken_pagination(self):
+        class FakeClient:
+            def get_json(self, endpoint, params):
+                return {'groups': [{'id': 'old', 'createdAt': '2026-10-13T12:00:00.000Z',
+                                    'kind': 'ranked', 'status': 'finished', 'ratedAt': 'old'}], 'more': True}
+
+        self.assertEqual(collector.recent_groups(FakeClient(), 'team', '2026-10-14T12:00:00.000Z',
+                                                '2026-10-15T12:00:00.000Z'), [])
+        with patch.object(FakeClient, 'get_json', return_value={'groups': [], 'more': True}):
+            with self.assertRaisesRegex(ValueError, 'no progress'):
+                collector.recent_groups(FakeClient(), 'team', 'start', 'end')
+
+    def test_every_refresh_fetches_current_leaders_independent_of_artifact(self):
+        sample = (Path('recent'), {'new-map'}, [{'teamId': 'now-first', 'rank': 1}],
+                  {'leaderboardUpdatedAt': '2026-10-15T12:00:00Z'})
+        with patch.object(collector, 'collect_current', return_value=sample) as current, \
+             patch.object(collector, 'latest_snapshot', side_effect=AssertionError('old archive must not gate freshness')), \
+             patch.object(collector, 'build_data', return_value={'fresh': True}) as build:
+            self.assertEqual(collector.refresh(lambda _: None), {'fresh': True})
+            collector.refresh(lambda _: None)
+        self.assertEqual(current.call_count, 2)
+        self.assertIsNone(build.call_args.args[1])
+        self.assertEqual(build.call_args.kwargs['match_ids'], {'new-map'})
+        self.assertEqual(build.call_args.kwargs['leaderboard'], sample[2])
+
     def test_interrupted_restore_is_retried_in_a_fresh_directory(self):
         artifact = {'id': 123, 'created_at': '2026-01-01T12:00:00Z'}
         with TemporaryDirectory() as directory:

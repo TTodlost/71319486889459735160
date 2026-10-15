@@ -15,7 +15,7 @@
   };
   const fullDate = value => {
     const date = new Date(value);
-    return value && !Number.isNaN(date.getTime()) ? new Intl.DateTimeFormat(undefined, {month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit'}).format(date) : 'Date unavailable';
+    return value && !Number.isNaN(date.getTime()) ? new Intl.DateTimeFormat(undefined, {month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short'}).format(date) : 'Date unavailable';
   };
   const make = (tag, className, text) => {
     const element = document.createElement(tag);
@@ -237,7 +237,7 @@
   function renderTeams(teams) {
     const body = $('team-body');
     body.replaceChildren();
-    if (!teams.length) empty(body, 5, 'No qualifying teams for these filters.');
+    if (!teams.length) empty(body, 7, 'No qualifying teams for these filters.');
     for (const team of [...teams].sort((a, b) => Number(b.games) - Number(a.games) || Number(b.winRate || 0) - Number(a.winRate || 0))) {
       const row = make('tr');
       const cell = make('td');
@@ -248,7 +248,7 @@
       cell.append(button);
       const win = make('td');
       win.append(rateBar(team.winRate));
-      row.append(cell, make('td', 'numeric', count(team.games)), make('td', 'numeric', count(team.wins)), make('td', 'numeric dim', count(Number(team.games) - Number(team.wins))), win);
+      row.append(cell, make('td', 'numeric', number(team.currentRank) === null ? '—' : `#${count(team.currentRank)}`), make('td', 'numeric dim', number(team.currentElo) === null ? '—' : count(Math.round(team.currentElo))), make('td', 'numeric', count(team.games)), make('td', 'numeric', count(team.wins)), make('td', 'numeric dim', count(Number(team.games) - Number(team.wins))), win);
       body.append(row);
     }
   }
@@ -299,8 +299,8 @@
         const side = make('span', `match-team${team.win ? ' winner' : ''}`);
         const info = make('span', 'match-team-text');
         info.append(make('span', 'match-team-name', team.name));
-        const rank = number(team.rank) !== null ? `#${count(team.rank)}` : number(team.rankMin) !== null && number(team.rankMax) !== null ? `#${count(team.rankMin)}–${count(team.rankMax)}` : 'Rank unavailable';
-        info.append(make('span', 'match-team-details', `${rank} · ${number(team.elo) === null ? 'Elo unavailable' : `${count(Math.round(team.elo))} Elo`}`));
+        const rank = number(team.currentRank) !== null ? `Current #${count(team.currentRank)}` : 'Not on current leaderboard';
+        info.append(make('span', 'match-team-details', `${rank} · ${number(team.currentElo) === null ? 'Current Elo unavailable' : `${count(Math.round(team.currentElo))} Elo`}`));
         side.append(info);
         if (team.win) side.append(make('span', 'win-label', 'WIN'));
         row.append(side);
@@ -315,26 +315,34 @@
     const summary = data.summary || {};
     const meta = data.meta || {};
     const detail = data.detail || {};
+    const coverage = BattlecodeStats.snapshotCoverage(source.current);
     const observations = number(detail.observations) ?? 0;
     const selected = state.filters.champion === 'all' ? 'All champions' : detail.championName || (data.options?.champions || []).find(champion => String(champion.id) === state.filters.champion)?.name || 'Selected champion';
-    text('snapshot-date', fullDate(meta.artifactCreatedAt || meta.updatedAt));
-    text('archive-size', `${count(meta.archiveGames)} games in published partial archive`);
+    text('snapshot-date', coverage.latestMatchAt ? fullDate(coverage.latestMatchAt) : 'No matches published in this window');
+    text('archive-size', `${count(coverage.games)} maps in published partial sample`);
+    text('leaderboard-date', fullDate(coverage.leaderboardUpdatedAt));
+    text('window-range', coverage.windowStartAt && coverage.windowEndAt ? `${fullDate(coverage.windowStartAt)} — ${fullDate(coverage.windowEndAt)}` : 'Requested window unavailable');
+    text('window-label', coverage.windowHours ? `REQUESTED ${count(coverage.windowHours)}-HOUR WINDOW` : 'REQUESTED WINDOW');
+    text('match-range', coverage.firstMatchAt && coverage.latestMatchAt ? `${fullDate(coverage.firstMatchAt)} — ${fullDate(coverage.latestMatchAt)}` : 'No downloaded maps in this publication');
+    text('build-date', fullDate(coverage.builtAt));
+    text('collection-limit', coverage.collectionTop ? `Replay collection targets the current top ${count(coverage.collectionTop)}${coverage.seriesPerTeam ? `, up to ${count(coverage.seriesPerTeam)} completed ranked series per team` : ''}${coverage.windowHours ? ` within the requested ${count(coverage.windowHours)} hours` : ''}. This is a partial sample; additional games may be unavailable or awaiting download.` : 'Published matches are a partial sample of downloaded replays.');
+    text('coverage-status', coverage.latestMatchAt ? `Newest published match: ${fullDate(coverage.latestMatchAt)}. Dataset build and archive upload times do not indicate when a game was played.` : 'No games are published for this requested window yet. A new dataset build does not itself add recent matches.');
     text('summary-games', count(summary.games));
     text('summary-observations', count(summary.teamObservations));
     text('summary-teams', count(summary.uniqueTeams));
-    text('summary-period', summary.start ? `${compactDate(summary.start)} — ${compactDate(summary.end)}` : 'No matches in this sample');
-    text('summary-rank', `Observed top ${state.filters.top} at match time`);
+    text('summary-period', summary.start ? `${fullDate(summary.start)} — ${fullDate(summary.end)}` : 'No matches in this sample');
+    text('summary-rank', `Current leaderboard top ${state.filters.top}`);
     text('summary-detail', count(observations));
     text('summary-detail-label', `BUILD SAMPLE · ${outcomeName().toUpperCase()}`);
     text('summary-detail-caption', `${selected === 'All champions' ? 'All champion' : selected} appearances`);
-    text('cohort-caption', state.filters.cohort === 'both' ? `Both sides ranked in the top ${state.filters.top} when the match began.` : `At least one top ${state.filters.top} side; only qualifying sides contribute observations.`);
+    text('cohort-caption', state.filters.cohort === 'both' ? `Both sides are in the published current leaderboard’s top ${state.filters.top}.` : `At least one current top ${state.filters.top} side; only those qualifying sides contribute observations.`);
     text('selected-champion-name', selected);
     text('item-denominator', `${count(observations)} champion appearances · ${outcomeName()} · purchase and inventory rates use this denominator.`);
     const games = number(summary.games) ?? 0;
     $('sample-warning').hidden = games >= 100;
     text('sample-warning', games === 0 ? 'No qualifying maps. Broaden the Elo cohort or change the queue, map or team.' : `Limited sample · ${count(games)} maps. Repeated maps from a series are correlated; rates are preliminary.`);
     text('builds-caption', `Exact end-of-match inventories across ${count(observations)} champion appearances.`);
-    if (meta.rankMethod) text('rank-method', typeof meta.rankMethod === 'string' ? meta.rankMethod : JSON.stringify(meta.rankMethod));
+    text('rank-method', `Cohort membership uses the current leaderboard snapshot from ${fullDate(coverage.leaderboardUpdatedAt)}. Historical match-start ranks do not determine inclusion. Teams absent from that snapshot are excluded.`);
     if (typeof meta.sampleNote === 'string') text('sample-method-note', meta.sampleNote);
     const validation = meta.validation;
     let validationText = 'Purchase attribution is checked against official match statistics; final inventories come from the official match data.';
@@ -346,7 +354,7 @@
       if (checked !== undefined) validationText = `${count(checked)} replay files validated${actions !== undefined ? ` across ${count(actions)} purchase actions` : ''}. Final inventories come from official match statistics.`;
     }
     text('validation-note', validationText);
-    text('artifact-note', meta.artifactId ? `Archive artifact ${meta.artifactId}${meta.updatedAt ? ` · dataset built ${fullDate(meta.updatedAt)}` : ''}` : `Published replay archive${meta.updatedAt ? ` · dataset built ${fullDate(meta.updatedAt)}` : ''}`);
+    text('artifact-note', `${meta.artifactId ? `Archive artifact ${meta.artifactId}` : 'Direct public API collection'}${coverage.artifactCreatedAt ? ` · archive uploaded ${fullDate(coverage.artifactCreatedAt)}` : ''}${coverage.builtAt ? ` · dataset built ${fullDate(coverage.builtAt)}` : ''}. Match times and leaderboard snapshot are listed separately above.`);
     updateOptions(data.options);
     renderChampions(data.champions || []);
     renderItems(data.items || [], observations);
@@ -359,6 +367,14 @@
   function loadStats() {
     if (!source.current) return;
     try {
+      const collectionTop = source.current.meta.collectionTop;
+      const maximum = Number.isInteger(collectionTop) && collectionTop > 0 ? Math.min(collectionTop, 10000) : 10000;
+      $('filter-top').max = String(maximum);
+      if (Number(state.filters.top) > maximum) {
+        state.filters.top = String(maximum);
+        history.replaceState(null, '', `${location.pathname}?${new URLSearchParams(state.filters)}${location.hash}`);
+        syncControls();
+      }
       if (state.filters.champion !== 'all' && !source.current.champions.some(champion => String(champion.id) === state.filters.champion)) {
         state.filters.champion = 'all';
         history.replaceState(null, '', `${location.pathname}?${new URLSearchParams(state.filters)}${location.hash}`);
@@ -396,7 +412,7 @@
       if (!source.current) {
         text('snapshot-date', 'Snapshot unavailable');
         text('archive-size', 'Check for updates to retry');
-        for (const [id, columns] of [['champion-body', 10], ['item-body', 7], ['team-body', 5], ['synergy-body', 4], ['antisynergy-body', 4], ['counter-body', 5]]) empty($(id), columns, 'Statistics unavailable. Check for updates to retry.');
+        for (const [id, columns] of [['champion-body', 10], ['item-body', 7], ['team-body', 7], ['synergy-body', 4], ['antisynergy-body', 4], ['counter-body', 5]]) empty($(id), columns, 'Statistics unavailable. Check for updates to retry.');
         for (const id of ['build-list', 'consumable-list', 'match-list']) $(id).replaceChildren(make('p', 'empty-cell', 'Statistics unavailable.'));
       }
     } finally {
@@ -416,7 +432,7 @@
     const input = $(`filter-${key}`);
     const apply = () => {
       const value = Number(input.value);
-      if (input.value !== '' && Number.isInteger(value) && value >= minimum && value <= 10000) {
+      if (input.value !== '' && Number.isInteger(value) && value >= minimum && value <= Number(input.max || 10000)) {
         changeFilter(key, value);
         return true;
       }

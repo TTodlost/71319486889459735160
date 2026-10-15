@@ -26,7 +26,10 @@ def team(tid, rank, win, champs):
 
 
 def fixture():
-    return {'meta': {}, 'champions': [{'id': 5, 'name': 'Stellar'}, {'id': 3, 'name': 'Cassi'}],
+    return {'meta': {}, 'leaderboard': [{'teamId': 'a', 'rank': 1, 'rating': 1699, 'name': 'a'},
+                                      {'teamId': 'b', 'rank': 2, 'rating': 1698, 'name': 'b'},
+                                      {'teamId': 'c', 'rank': 40, 'rating': 1660, 'name': 'c'}],
+            'champions': [{'id': 5, 'name': 'Stellar'}, {'id': 3, 'name': 'Cassi'}],
             'items': [{'id': 8, 'name': 'Power Shard Of Focus', 'purchasable': True},
                       {'id': 9, 'name': 'Power Emblem Of Focus', 'purchasable': False}],
             'matches': [
@@ -81,10 +84,41 @@ class AggregationTests(unittest.TestCase):
         self.assertEqual(empty['summary']['games'], 0)
         self.assertIsNone(empty['champions'][0]['winRate'])
 
-    def test_uncertain_boundary_membership_is_excluded(self):
+    def test_current_leaderboard_membership_replaces_historical_rank(self):
         data = fixture()
-        data['matches'][0]['teams'][0].update(rank=None, rankMin=20, rankMax=21)
+        data['leaderboard'][1]['rank'] = 40
+        data['leaderboard'][2]['rank'] = 2
+        data['matches'][1]['teams'][0].update(verified=False, rank=None, rankMin=None, rankMax=None)
+        result = app.aggregate(data)
+        self.assertEqual(result['summary']['games'], 1)
+        self.assertEqual(result['recentMatches'][0]['id'], 'mixed')
+        self.assertEqual(result['summary']['teamObservations'], 2)
+        self.assertEqual(result['champions'][0]['winRate'], 50)
+        promoted = next(row for row in result['teamRows'] if row['id'] == 'c')
+        self.assertEqual(promoted['currentRank'], 2)
+        self.assertEqual(result['recentMatches'][0]['teams'][1]['rank'], 40)
+        self.assertEqual(result['recentMatches'][0]['teams'][1]['currentRank'], 2)
+
+    def test_current_rank_cutoff_and_missing_membership(self):
+        data = fixture()
+        data['leaderboard'][0]['rank'] = 20
+        self.assertEqual(app.aggregate(data)['summary']['games'], 1)
+        data['leaderboard'][0]['rank'] = 21
         self.assertEqual(app.aggregate(data)['summary']['games'], 0)
+        data['leaderboard'] = []
+        self.assertEqual(app.aggregate(data, {'cohort': 'either'})['summary']['games'], 0)
+
+    def test_missing_or_invalid_current_leaderboard_is_rejected(self):
+        for leaderboard in (None, {}, [{'teamId': 'a', 'rank': True}], [{'teamId': 'a', 'rank': 0}],
+                            [{'teamId': 'a', 'rank': 1}, {'teamId': 'a', 'rank': 2}]):
+            data = fixture()
+            data['leaderboard'] = leaderboard
+            with self.subTest(leaderboard=leaderboard), self.assertRaisesRegex(ValueError, 'Current leaderboard'):
+                app.aggregate(data)
+        data = fixture()
+        data['meta']['collectionTop'] = 20
+        with self.assertRaisesRegex(ValueError, 'current top 20'):
+            app.aggregate(data, {'top': '21'})
 
     def test_invalid_filters_rejected(self):
         for query in ({'top': '0'}, {'kind': 'typo'}, {'champion': '999'}, {'cohort': 'typo'}):
@@ -198,6 +232,7 @@ class AggregationTests(unittest.TestCase):
         data = fixture()
         match = data['matches'][0]
         match['teams'] = [team('a', 1, True, [champion(5)]), team('b', 40, False, [champion(3)])]
+        data['leaderboard'][1]['rank'] = 40
         data['matches'] = [match]
         result = app.aggregate(data, {'cohort': 'either'})
         self.assertEqual(len(result['counters']), 1)

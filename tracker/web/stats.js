@@ -22,9 +22,39 @@
     if (typeof value !== 'string' || !/^[+-]?\d+(?:_\d+)*$/.test(value.trim())) throw new Error('Expected an integer');
     return Number(value.trim().replaceAll('_', ''));
   }
+  function currentLeaderboard(data) {
+    if (!Array.isArray(data.leaderboard)) throw new Error('Current leaderboard snapshot is unavailable');
+    const result = new Map();
+    for (const row of data.leaderboard) {
+      if (!row || typeof row !== 'object' || Array.isArray(row) || typeof row.teamId !== 'string' || !Number.isInteger(row.rank) || row.rank < 1 || result.has(row.teamId) ||
+          (row.rating !== undefined && row.rating !== null && (typeof row.rating !== 'number' || !Number.isFinite(row.rating))) ||
+          (row.name !== undefined && typeof row.name !== 'string')) throw new Error('Current leaderboard snapshot is invalid');
+      result.set(row.teamId, row);
+    }
+    return result;
+  }
+  function snapshotCoverage(data) {
+    const meta = data.meta || {};
+    const times = (data.matches || []).map(match => match.startedAt).sort(compareText);
+    return {
+      firstMatchAt: meta.matchStartAt ?? times[0] ?? null,
+      latestMatchAt: meta.matchEndAt ?? times.at(-1) ?? null,
+      leaderboardUpdatedAt: meta.leaderboardUpdatedAt ?? null,
+      windowStartAt: meta.sampleStartAt ?? null,
+      windowEndAt: meta.sampleEndAt ?? null,
+      windowHours: meta.sampleWindowHours ?? null,
+      builtAt: meta.updatedAt ?? null,
+      artifactCreatedAt: meta.artifactCreatedAt ?? null,
+      collectionTop: meta.collectionTop ?? null,
+      seriesPerTeam: meta.seriesPerTeam ?? null,
+      games: (data.matches || []).length
+    };
+  }
   function aggregate(data, query = {}) {
     const top = integer(query.top ?? '20');
     if (top < 1 || top > 10000) throw new Error('top must be between 1 and 10000');
+    if (Number.isInteger(data.meta?.collectionTop) && data.meta.collectionTop > 0 && top > data.meta.collectionTop) throw new Error(`This snapshot collects replays for only the current top ${data.meta.collectionTop} teams`);
+    const leaderboard = currentLeaderboard(data);
     const minimum = Object.hasOwn(query, 'minGames') ? query.minGames : '10';
     if (!['number', 'string'].includes(typeof minimum) || (typeof minimum === 'number' && !Number.isInteger(minimum))) throw new Error('minGames must be an integer between 0 and 10000');
     const minGames = integer(minimum);
@@ -41,7 +71,7 @@
     for (const match of data.matches) {
       if (filters.kind !== 'all' && match.kind !== filters.kind) continue;
       if (filters.map !== 'all' && match.map !== filters.map) continue;
-      let eligible = match.teams.filter(team => team.verified && team.rankMax <= top);
+      let eligible = match.teams.filter(team => leaderboard.has(team.id) && leaderboard.get(team.id).rank <= top);
       if ((filters.cohort === 'both' && eligible.length !== 2) || !eligible.length) continue;
       if (filters.team !== 'all') eligible = eligible.filter(team => team.id === filters.team);
       if (!eligible.length) continue;
@@ -100,15 +130,18 @@
       if (!teams.has(team.id)) teams.set(team.id, []);
       teams.get(team.id).push(team);
     }
-    const teamRows = [...teams].map(([id, values]) => ({id, name: values[0].name, games: values.length,
+    const teamRows = [...teams].map(([id, values]) => ({id, name: leaderboard.get(id).name ?? values[0].name, games: values.length,
+      currentRank: leaderboard.get(id).rank, currentElo: leaderboard.get(id).rating ?? null,
       wins: sum(values, team => team.win), winRate: percentage(sum(values, team => team.win), values.length)}))
       .sort((a, b) => b.games - a.games || compareText(a.name, b.name));
     const recent = [...games].sort((a, b) => compareText(b.startedAt, a.startedAt)).slice(0, 50).map(match => ({
       id: match.id, url: match.url, map: match.map, startedAt: match.startedAt, rounds: match.rounds,
-      teams: match.teams.map(team => ({name: team.name, rank: team.rank, rankMin: team.rankMin, rankMax: team.rankMax, elo: team.elo, win: team.win}))
+      teams: match.teams.map(team => ({name: team.name, rank: team.rank, rankMin: team.rankMin, rankMax: team.rankMax, elo: team.elo, win: team.win,
+        currentRank: leaderboard.get(team.id)?.rank ?? null, currentElo: leaderboard.get(team.id)?.rating ?? null}))
     }));
     const allTeams = new Map();
     for (const match of data.matches) for (const team of match.teams) allTeams.set(team.id, team.name);
+    for (const [id, row] of leaderboard) if (row.name !== undefined) allTeams.set(id, row.name);
     const times = games.map(match => match.startedAt).sort(compareText);
     const definitions = new Map(data.champions.map(champion => [champion.id, {id: champion.id, name: champion.name}]));
     const baseline = new Map(championRows.map(champion => [champion.id, champion.winRate]));
@@ -157,6 +190,7 @@
     const object = value => value && typeof value === 'object' && !Array.isArray(value);
     const finite = value => typeof value === 'number' && Number.isFinite(value);
     if (!object(data) || !object(data.meta) || !Array.isArray(data.champions) || !Array.isArray(data.items) || !Array.isArray(data.matches)) fail();
+    currentLeaderboard(data);
     const championIds = new Set(), itemIds = new Set();
     for (const champion of data.champions) {
       if (!object(champion) || !Number.isInteger(champion.id) || champion.id < 0 || typeof champion.name !== 'string' || championIds.has(champion.id)) fail();
@@ -184,5 +218,5 @@
     }
     return data;
   }
-  return {aggregate, validateDataset};
+  return {aggregate, validateDataset, snapshotCoverage};
 });

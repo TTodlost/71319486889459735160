@@ -61,7 +61,7 @@ def sync_lock(outdir):
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def discover(client, catalog, max_pages=None, full=False):
+def discover(client, catalog, max_pages=None, full=False, recent_ids=None):
     if full:
         catalog.set_meta("scan_state", None)
         catalog.set_meta("discovery_frontier", None)
@@ -92,6 +92,8 @@ def discover(client, catalog, max_pages=None, full=False):
         for group in groups:
             created = timestamp(group.get("createdAt"))
             catalog.upsert_group(group)
+            if recent_ids is not None and not params.get("before"):
+                recent_ids.add(fetch.identifier(group.get("id")))
             discovered += 1
             if state["stop_at"] and created < timestamp(state["stop_at"]["created_at"]):
                 stop = True
@@ -121,6 +123,51 @@ def discover(client, catalog, max_pages=None, full=False):
     return discovered
 
 
+def refresh_head(client, catalog, recent_ids):
+    """Index one current page without modifying an older discovery checkpoint.
+
+    This is a freshness sample, not a claim of complete history. In particular,
+    the public API can omit timestamp ties across global pagination boundaries.
+    """
+    data = client.get_json("/api/v1/match-groups", {"scope": "all"})
+    groups = fetch.rows(data, "groups")
+    if type(data.get("more")) is not bool or not groups and data["more"]:
+        raise fetch.FetchError("Invalid current match-history page")
+    for group in groups:
+        catalog.upsert_group(group)
+        recent_ids.add(fetch.identifier(group.get("id")))
+    return len(groups)
+
+
+def work_order(catalog, kind, identifiers, recent_ids, limit):
+    """Reserve current work while retaining the persistent fair queue's share."""
+    fair = catalog.order_attempts(kind, identifiers)
+    recent = [identifier for identifier in fair if identifier in recent_ids]
+    older = [identifier for identifier in fair if identifier not in recent_ids]
+    if not recent or not older or limit == 0:
+        return fair
+    if limit is None:
+        limit = len(fair)
+    if limit == 1:
+        key = f"recent_{kind}_turn"
+        current_turn = catalog.get_meta(key) is not False
+        catalog.set_meta(key, not current_turn)
+        return (recent if current_turn else older)[:1]
+    current_work = recent[:limit // 2]
+    older_work = older[:limit - len(current_work)]
+    selected = []
+    # Interleave the reserved shares so a wall-clock interruption after slow
+    # current requests cannot continually prevent the older share from running.
+    for index in range(max(len(current_work), len(older_work))):
+        if index < len(current_work):
+            selected.append(current_work[index])
+        if index < len(older_work):
+            selected.append(older_work[index])
+    chosen = set(selected)
+    selected += [identifier for identifier in fair if identifier not in chosen][:limit - len(selected)]
+    return selected
+
+
 def local_group_ids(outdir):
     groups = set()
     for path in Path(outdir).glob("*/*.repl26a"):
@@ -140,8 +187,25 @@ def sync_once(client, catalog, *, max_pages=None, max_details=None, max_download
     if origin(client.base_url) != catalog.base_url:
         raise fetch.FetchError("Client origin does not match the replay catalog")
     stats = {"discovered": 0, "details": 0, "new_downloads": 0, "existing": 0, "errors": 0}
+    recent_ids = set()
+    remaining_pages = max_pages
+    state = catalog.get_meta("scan_state")
+    if not full and state and state.get("before") and max_pages != 0:
+        # A one-page budget cannot advance both cursors. Alternate its share;
+        # larger budgets always check the head before continuing backfill.
+        head_turn = max_pages != 1 or catalog.get_meta("recent_page_turn") is not False
+        if max_pages == 1:
+            catalog.set_meta("recent_page_turn", not head_turn)
+        if head_turn:
+            if remaining_pages is not None:
+                remaining_pages -= 1
+            try:
+                stats["discovered"] += refresh_head(client, catalog, recent_ids)
+            except (fetch.FetchError, OSError) as error:
+                stats["errors"] += 1
+                print(f"Current history failed; backfill checkpoint retained: {error}", file=sys.stderr)
     try:
-        stats["discovered"] = discover(client, catalog, max_pages, full)
+        stats["discovered"] += discover(client, catalog, remaining_pages, full, recent_ids)
     except (fetch.FetchError, OSError) as error:
         stats["errors"] += 1
         print(f"Discovery failed; checkpoint retained: {error}", file=sys.stderr)
@@ -152,7 +216,7 @@ def sync_once(client, catalog, *, max_pages=None, max_details=None, max_download
     detail_ids = list(imported) + list(catalog.group_ids_needing_detail())
     detail_ids = list(dict.fromkeys(detail_ids))
     detail_ids.sort(key=lambda group_id: group_id not in local_groups)
-    detail_ids = catalog.order_attempts("detail", detail_ids)
+    detail_ids = work_order(catalog, "detail", detail_ids, recent_ids, max_details)
     for group_id in detail_ids:
         if max_details is not None and stats["details"] >= max_details:
             break
@@ -186,7 +250,8 @@ def sync_once(client, catalog, *, max_pages=None, max_details=None, max_download
 
     attempts = 0
     pending = {record["match_id"]: record for record in catalog.replay_records(pending_only=True)}
-    for match_id in catalog.order_attempts("download", list(pending)):
+    recent_matches = {match_id for match_id, record in pending.items() if record["group_id"] in recent_ids}
+    for match_id in work_order(catalog, "download", list(pending), recent_matches, max_downloads):
         if max_downloads is not None and attempts >= max_downloads:
             break
         attempts += 1

@@ -1,6 +1,8 @@
 name: High Elo tracker
 
 on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
   push:
     branches: [main]
     paths:
@@ -24,7 +26,7 @@ jobs:
   build:
     if: github.event_name != 'workflow_run' || (github.event.workflow_run.head_repository.full_name == github.repository && github.event.workflow_run.event != 'pull_request')
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 35
     permissions:
       contents: read
       actions: read
@@ -42,17 +44,19 @@ jobs:
         run: python -m unittest discover -s tracker -p 'test_*.py' -v
       - name: Test browser statistics
         run: node tracker/test_static.mjs
-      - name: Restore verified replay decoding cache
+      - name: Restore recent replays and verified decoding cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: tracker/.cache/decoded
-          key: tracker-decode-v1-${{ runner.os }}-${{ hashFiles('tracker/replay_extract.py', 'tracker/protocol.py', 'tracker/formats.py') }}-${{ github.run_id }}
+          path: |
+            tracker/.cache/decoded
+            tracker/.cache/current
+          key: tracker-current-v2-${{ runner.os }}-${{ hashFiles('tracker/replay_extract.py', 'tracker/protocol.py', 'tracker/formats.py') }}-${{ github.run_id }}
           restore-keys: |
-            tracker-decode-v1-${{ runner.os }}-${{ hashFiles('tracker/replay_extract.py', 'tracker/protocol.py', 'tracker/formats.py') }}-
-      - name: Restore the latest replay artifact, repair Elo, and build the static dashboard
-        env:
-          GH_TOKEN: ${{ github.token }}
+            tracker-current-v2-${{ runner.os }}-${{ hashFiles('tracker/replay_extract.py', 'tracker/protocol.py', 'tracker/formats.py') }}-
+      - name: Fetch current leaderboard games and build the static dashboard
         run: python tracker/build_pages.py --outdir .site
+      - name: Validate the published browser dataset
+        run: node -e "require('./tracker/web/stats.js').validateDataset(require('./.site/data.json'))"
       - name: Upload the website
         uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:

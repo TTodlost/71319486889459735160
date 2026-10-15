@@ -182,7 +182,7 @@ class SyncTests(unittest.TestCase):
         for path in self.files():
             self.assertEqual(path.read_bytes(), REPLAY_BYTES)
 
-    def test_cursor_continues_after_process_restart_instead_of_restarting_prefix(self):
+    def test_cursor_continues_after_current_head_refresh_and_process_restart(self):
         first = group()
         first_client = self.client([(None, page(first, more=True))], {GROUP_A: detail(first, MATCH_A)})
         self.run_sync(first_client, max_pages=1)
@@ -192,9 +192,10 @@ class SyncTests(unittest.TestCase):
         self.reopen()
         second = group(GROUP_B, created=OLD)
         second_client = self.client([
+            (None, page(first, more=True)),
             ('2026-10-14T10:00:00.000Z_64013d4f-257c-43c5-bf6a-6b0fd598a7f4', page(second)),
         ], {GROUP_B: detail(second, MATCH_B)})
-        self.run_sync(second_client, max_pages=1)
+        self.run_sync(second_client, max_pages=2)
         self.assertEqual(len(self.files()), 2)
         self.assertTrue(self.catalog.get_meta('history_complete'))
         self.assertFalse(self.catalog.get_meta('scan_state'))
@@ -210,10 +211,100 @@ class SyncTests(unittest.TestCase):
         self.reopen()
         second = group(GROUP_B, created=OLD)
         resumed = self.client([
+            (None, page(first, more=True)),
             ('2026-10-14T10:00:00.000Z_64013d4f-257c-43c5-bf6a-6b0fd598a7f4', page(second)),
         ], {GROUP_A: detail(first, MATCH_A), GROUP_B: detail(second, MATCH_B)})
         self.run_sync(resumed)
         self.assertEqual(len(self.files()), 2)
+
+    def test_resumed_head_and_old_queues_share_page_detail_and_download_budgets(self):
+        first, second = group(), group(GROUP_B, created=OLD)
+        fresh = group(GROUP_C, created='2026-10-14T12:00:00.000Z')
+        oldest = group(GROUP_D, created=OLDER)
+        self.catalog.store_detail(detail(first, MATCH_A))
+        self.catalog.upsert_group(second)
+        self.catalog.order_attempts('detail', [GROUP_B])
+        self.catalog.order_attempts('download', [MATCH_A])
+        state = {'before': NEW + '_' + GROUP_A, 'newest': {'created_at': NEW, 'id': GROUP_A},
+                 'stop_at': None, 'observed_at': '2026-10-14T11:00:00+00:00'}
+        self.catalog.set_meta('scan_state', state)
+        client = self.client([(None, page(fresh, more=True)),
+                              (NEW + '_' + GROUP_A, page(oldest, more=True))],
+                             {GROUP_B: detail(second, MATCH_B), GROUP_C: detail(fresh, MATCH_C)})
+        result = self.run_sync(client, max_pages=2, max_details=2, max_downloads=2)
+        self.assertEqual(result['errors'], 0)
+        listings = [call for call in client.get_json.call_args_list if call.args[0] == '/api/v1/match-groups']
+        self.assertEqual(len(listings), 2)
+        self.assertEqual([call.args[0] for call in self.detail_calls(client)], [ROUTES[GROUP_C], ROUTES[GROUP_B]])
+        self.assertEqual([call.args[0] for call in client.download.call_args_list],
+                         [REPLAY_URLS[MATCH_C], REPLAY_URLS[MATCH_A]])
+        self.assertTrue(self.replay_path(GROUP_C, MATCH_C).is_file())
+        self.assertTrue(self.replay_path(GROUP_A, MATCH_A).is_file())
+        self.assertFalse(self.replay_path(GROUP_B, MATCH_B).exists())
+        expected_state = dict(state, before=OLDER + '_' + GROUP_D)
+        self.assertEqual(self.catalog.get_meta('scan_state'), expected_state)
+        self.assertIsNone(self.catalog.get_meta('history_through'))
+        for record in self.catalog.replay_records():
+            self.assertTrue(all(side['elo_at_time'] is None for side in record['teams']))
+
+    def test_single_page_budget_alternates_head_and_backfill_across_restart(self):
+        first, second = group(), group(GROUP_B, created=OLD)
+        fresh = group(GROUP_C, created='2026-10-14T12:00:00.000Z')
+        initial = self.client([(None, page(first, more=True))])
+        self.run_sync(initial, max_pages=1, max_details=0, max_downloads=0)
+        saved = self.catalog.get_meta('scan_state')
+        self.reopen()
+        head = self.client([(None, page(fresh, more=True))], {GROUP_C: detail(fresh, MATCH_C)})
+        self.run_sync(head, max_pages=1, max_details=1, max_downloads=1)
+        self.assertEqual(self.catalog.get_meta('scan_state'), saved)
+        self.assertTrue(self.replay_path(GROUP_C, MATCH_C).is_file())
+        self.reopen()
+        backfill = self.client([(NEW + '_' + GROUP_A, page(second, more=True))],
+                               {GROUP_A: detail(first, MATCH_A)})
+        self.run_sync(backfill, max_pages=1, max_details=1, max_downloads=1)
+        self.assertEqual(self.catalog.get_meta('scan_state')['before'], OLD + '_' + GROUP_B)
+        self.assertTrue(self.replay_path(GROUP_A, MATCH_A).is_file())
+        self.assertEqual(len(self.detail_calls(head)), 1)
+        self.assertEqual(len(self.detail_calls(backfill)), 1)
+
+    def test_current_head_failure_does_not_block_backfill_or_queued_downloads(self):
+        first, second = group(), group(GROUP_B, created=OLD)
+        initial = self.client([(None, page(first, more=True))], {GROUP_A: detail(first, MATCH_A)})
+        self.run_sync(initial, max_pages=1, max_downloads=0)
+        self.reopen()
+        resumed = self.client([(None, fetch_replays.FetchError('head temporarily unavailable')),
+                               (NEW + '_' + GROUP_A, page(second))])
+        result = self.run_sync(resumed, max_pages=2, max_details=0, max_downloads=1)
+        self.assertEqual(result['errors'], 1)
+        self.assertIsNone(self.catalog.get_meta('scan_state'))
+        self.assertEqual(resumed.download.call_count, 1)
+        self.assertTrue(self.replay_path().is_file())
+
+    def test_single_detail_slot_alternates_failed_head_work_with_old_queue(self):
+        first, second = group(), group(GROUP_B, created=OLD)
+        fresh = group(GROUP_C, created='2026-10-14T12:00:00.000Z')
+        oldest = group(GROUP_D, created=OLDER)
+        self.catalog.upsert_group(second)
+        self.catalog.order_attempts('detail', [GROUP_B])
+        self.catalog.set_meta('scan_state', {'before': NEW + '_' + GROUP_A,
+            'newest': {'created_at': NEW, 'id': GROUP_A}, 'stop_at': None})
+        first_pass = self.client([(None, page(fresh, more=True)),
+                                  (NEW + '_' + GROUP_A, page(oldest, more=True))],
+                                 {GROUP_C: fetch_replays.FetchError('fresh detail unavailable')})
+        self.assertEqual(self.run_sync(first_pass, max_pages=2, max_details=1, max_downloads=0)['errors'], 1)
+        self.assertEqual([c.args[0] for c in self.detail_calls(first_pass)], [ROUTES[GROUP_C]])
+        self.reopen()
+        second_pass = self.client([(None, page(fresh, more=True)), (OLDER + '_' + GROUP_D, page())],
+                                  {GROUP_B: detail(second, MATCH_B)})
+        self.run_sync(second_pass, max_pages=2, max_details=1, max_downloads=1)
+        self.assertEqual([c.args[0] for c in self.detail_calls(second_pass)], [ROUTES[GROUP_B]])
+        self.assertTrue(self.replay_path(GROUP_B, MATCH_B).is_file())
+
+    def test_reserved_work_interleaves_old_attempts_before_second_fresh_attempt(self):
+        self.catalog.order_attempts('detail', [GROUP_A, GROUP_B])
+        ordered = sync_replays.work_order(self.catalog, 'detail',
+            [GROUP_A, GROUP_B, GROUP_C, GROUP_D], {GROUP_C, GROUP_D}, 4)
+        self.assertEqual(ordered, [GROUP_C, GROUP_A, GROUP_D, GROUP_B])
 
     def test_cursor_does_not_advance_when_group_cache_write_fails(self):
         first, second = group(), group(GROUP_B, created=OLD)
@@ -555,7 +646,8 @@ class SyncTests(unittest.TestCase):
         self.clock.now.return_value = datetime.fromisoformat('2026-10-14T14:00:00+00:00')
         late_detail = detail(newest, MATCH_A)
         late_detail['matches'][0]['startedAt'] = '2026-10-14T13:00:00Z'
-        client = self.client([('2026-10-14T10:00:00.000Z_64013d4f-257c-43c5-bf6a-6b0fd598a7f4', page(older))],
+        client = self.client([(None, page(newest, more=True)),
+                              ('2026-10-14T10:00:00.000Z_64013d4f-257c-43c5-bf6a-6b0fd598a7f4', page(older))],
                              {GROUP_A: late_detail, GROUP_B: detail(older, MATCH_B)})
         self.run_sync(client)
         late_record = next(row for row in self.catalog.replay_records() if row['match_id'] == MATCH_A)
