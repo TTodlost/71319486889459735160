@@ -6,3 +6,8 @@ replays/
 replay-state.tar.gz
 !bootstrap/replay-state.tar.gz
 *.part
+tracker/.cache/
+tracker/.state.json
+tracker/data.json
+.site/
+.preview/
