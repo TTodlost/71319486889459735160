@@ -36,6 +36,18 @@ class FetchError(RuntimeError):
     """A failed request or an unexpected website/download response."""
 
 
+class RateLimitError(FetchError):
+    """The website requires a cooldown before another request is made."""
+
+    def __init__(self, message, retry_after):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class _RetryableReplayResponse(FetchError):
+    """Downloaded bytes failed validation and may be a transient response."""
+
+
 def identifier(value: str) -> str:
     try:
         return str(UUID(value))
@@ -56,6 +68,7 @@ class Client:
         self.retries = retries
         self.opener = build_opener()
         self.last_request = 0.0
+        self._rate_limit_until = 0.0
 
     def url(self, path: str) -> str:
         resolved = urljoin(self.base_url + "/", path)
@@ -80,12 +93,13 @@ class Client:
                     pass
         if not math.isfinite(wait):
             wait = min(2 ** attempt, 10)
-        if wait > 60:
-            raise FetchError(f"Rate limited; retry after {math.ceil(wait)} seconds") from error
         return max(0, wait)
 
     def _request(self, path, consume):
         url = self.url(path)
+        remaining = self._rate_limit_until - time.monotonic()
+        if remaining > 0:
+            raise RateLimitError(f"Rate limited; retry after {math.ceil(remaining)} seconds", remaining)
         for attempt in range(self.retries + 1):
             pause = self.delay - (time.monotonic() - self.last_request)
             if pause > 0:
@@ -98,9 +112,22 @@ class Client:
                     return consume(response)
             except HTTPError as error:
                 error.close()
-                if error.code not in (429, 500, 502, 503, 504) or attempt == self.retries:
+                if error.code == 429:
+                    wait = self._retry_delay(error, attempt)
+                    if attempt == self.retries or wait > 60:
+                        self._rate_limit_until = time.monotonic() + wait
+                        raise RateLimitError(
+                            f"HTTP 429 for {url}; retry after {math.ceil(wait)} seconds", wait) from error
+                elif error.code not in (500, 502, 503, 504) or attempt == self.retries:
                     hint = "; public access requires a session on this event" if error.code in (401, 403) else ""
                     raise FetchError(f"HTTP {error.code} for {url}{hint}") from error
+                else:
+                    wait = self._retry_delay(error, attempt)
+                if wait > 60:
+                    raise FetchError(f"Rate limited; retry after {math.ceil(wait)} seconds") from error
+            except _RetryableReplayResponse as error:
+                if attempt == self.retries:
+                    raise FetchError(f"Invalid replay response from {url}: {error}") from error
                 wait = self._retry_delay(error, attempt)
             except (URLError, TimeoutError, ConnectionError, http.client.HTTPException) as error:
                 if attempt == self.retries:
@@ -136,6 +163,10 @@ class Client:
                 shutil.copyfileobj(response, output, length=1024 * 1024)
                 if expected is not None and output.tell() != expected:
                     raise http.client.IncompleteRead(b"")
+            try:
+                validate_replay(destination)
+            except FetchError as error:
+                raise _RetryableReplayResponse(str(error)) from error
         self._request(path, consume)
 
 
@@ -441,7 +472,8 @@ def main(argv=None):
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--timeout", type=nonnegative_float, default=30)
     parser.add_argument("--delay", type=nonnegative_float, default=.25, help="minimum seconds between requests (default: .25)")
-    parser.add_argument("--retries", type=int, default=3, help="retries for transient HTTP/network failures (default: 3)")
+    parser.add_argument("--retries", type=int, default=3,
+                        help="retries for transient HTTP/network failures or invalid replay responses (default: 3)")
     args = parser.parse_args(argv)
     if args.timeout == 0 or args.retries < 0:
         parser.error("--timeout must be positive and --retries must be nonnegative")
@@ -489,6 +521,8 @@ def main(argv=None):
                     downloaded += int(fresh)
                     skipped += int(not fresh)
                     print(f"{'Downloaded' if fresh else 'Exists'}: {destination}")
+                except RateLimitError:
+                    raise
                 except (FetchError, OSError) as error:
                     failed += 1
                     print(f"Failed {record['match_id']}: {error}", file=sys.stderr)

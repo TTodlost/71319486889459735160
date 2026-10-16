@@ -511,6 +511,68 @@ class SyncTests(unittest.TestCase):
             if expected_files != 1:
                 self.assertFalse(self.detail_calls(client))
 
+    def test_rate_limited_discovery_stops_before_queued_downloads(self):
+        first, second = group(), group(GROUP_B, created=OLD)
+        initial = self.client([(None, page(first, second))],
+                              {GROUP_A: detail(first, MATCH_A), GROUP_B: detail(second, MATCH_B)})
+        self.run_sync(initial, max_downloads=0)
+        limited = self.client([(None, fetch_replays.RateLimitError('Rate limited; retry after 120 seconds', 120))])
+        with self.assertRaises(fetch_replays.RateLimitError):
+            self.run_sync(limited)
+        limited.download.assert_not_called()
+        self.assertEqual(len(list(self.catalog.replay_records(pending_only=True))), 2)
+        self.assertIsNotNone(self.catalog.get_meta('scan_state'))
+        self.reopen()
+        resumed = self.client([(None, page(first, second))])
+        self.assertEqual(self.run_sync(resumed)['new_downloads'], 2)
+
+    def test_rate_limited_head_does_not_request_backfill(self):
+        first = group()
+        initial = self.client([(None, page(first, more=True))])
+        self.run_sync(initial, max_pages=1, max_details=0, max_downloads=0)
+        checkpoint = self.catalog.get_meta('scan_state')
+        limited = self.client([(None, fetch_replays.RateLimitError('Rate limited; retry after 5 seconds', 5))])
+        with self.assertRaises(fetch_replays.RateLimitError):
+            self.run_sync(limited, max_pages=2)
+        self.assertEqual(limited.get_json.call_count, 1)
+        limited.download.assert_not_called()
+        self.assertEqual(self.catalog.get_meta('scan_state'), checkpoint)
+
+    def test_rate_limited_detail_stops_before_other_groups(self):
+        first, second = group(), group(GROUP_B, created=OLD)
+        initial = self.client([(None, page(first, second))])
+        self.run_sync(initial, max_details=0, max_downloads=0)
+        limited = self.client([(None, page(first, second))],
+                              {GROUP_A: fetch_replays.RateLimitError('Rate limited; retry after 5 seconds', 5),
+                               GROUP_B: detail(second, MATCH_B)})
+        with self.assertRaises(fetch_replays.RateLimitError):
+            self.run_sync(limited)
+        self.assertEqual(len(self.detail_calls(limited)), 1)
+        limited.download.assert_not_called()
+        self.assertEqual(len(list(self.catalog.group_ids_needing_detail())), 2)
+
+    def test_rate_limited_download_preserves_files_and_pending_work_for_restart(self):
+        first, second, third = group(), group(GROUP_B, created=OLD), group(GROUP_C, created=OLDER)
+        initial = self.client([(None, page(first, second, third))],
+                              {GROUP_A: detail(first, MATCH_A), GROUP_B: detail(second, MATCH_B),
+                               GROUP_C: detail(third, MATCH_C)})
+        self.run_sync(initial, max_downloads=1)
+        existing = self.replay_path().read_bytes()
+        metadata = self.replay_path().with_suffix('.json').read_bytes()
+        limited = self.client([(None, page(first, second, third))])
+        limited.download.side_effect = fetch_replays.RateLimitError('Rate limited; retry after 5 seconds', 5)
+        with self.assertRaises(fetch_replays.RateLimitError):
+            self.run_sync(limited)
+        self.assertEqual(limited.download.call_count, 1)
+        self.assertEqual(self.replay_path().read_bytes(), existing)
+        self.assertEqual(self.replay_path().with_suffix('.json').read_bytes(), metadata)
+        self.assertEqual(list(self.outdir.glob('*/*.part')), [])
+        self.reopen()
+        self.assertEqual(len(list(self.catalog.replay_records(pending_only=True))), 2)
+        resumed = self.client([(None, page(first, second, third))])
+        self.assertEqual(self.run_sync(resumed)['new_downloads'], 2)
+        self.assertEqual(len(self.files()), 3)
+
     def test_failed_download_retries_from_catalog_after_restart(self):
         first, second = group(), group(GROUP_B, created=OLD)
         initial = self.client([(None, page(first, second))],

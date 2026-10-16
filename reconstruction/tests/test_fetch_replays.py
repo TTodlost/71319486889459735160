@@ -8,7 +8,7 @@ import struct
 import sys
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 import zipfile
@@ -56,6 +56,14 @@ def archive_bytes(replay=REPLAY_BYTES, *, member='replay.repl26a'):
         archive.writestr(member, replay)
         archive.writestr('result.json', '{"status":"completed"}')
     return buffer.getvalue()
+
+
+def corrupt_archive_bytes():
+    payload = bytearray(archive_bytes())
+    name_length, extra_length = struct.unpack_from('<HH', payload, 26)
+    data_offset = 30 + name_length + extra_length
+    payload[data_offset + len(REPLAY_BYTES) - 1] ^= 0x01
+    return bytes(payload)
 
 
 class ScriptedClient:
@@ -167,6 +175,109 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(client.opener.open.call_count, 1)
         sleep.assert_not_called()
 
+    def test_rate_limit_cooldown_blocks_requests_until_monotonic_expiry(self):
+        client = self.client(retries=1)
+        client.opener.open.side_effect = [HTTPError(
+            'https://2026a.battlecode.co.uk/api/v1/ladder', 429, 'rate limited',
+            {'Retry-After': '120'}, BytesIO(b'')), Response(b'{"teams":[]}')]
+        with patch.object(fetch_replays.time, 'sleep') as sleep, \
+                patch.object(fetch_replays.time, 'monotonic', return_value=100) as monotonic:
+            with self.assertRaises(fetch_replays.RateLimitError) as first:
+                client.get_json('/api/v1/ladder')
+            self.assertEqual(first.exception.retry_after, 120)
+            monotonic.return_value = 150
+            with self.assertRaises(fetch_replays.RateLimitError) as second:
+                client.get_json('/api/v1/match-groups')
+            self.assertEqual(second.exception.retry_after, 70)
+            self.assertEqual(client.opener.open.call_count, 1)
+            monotonic.return_value = 221
+            self.assertEqual(client.get_json('/api/v1/ladder'), {'teams': []})
+        self.assertEqual(client.opener.open.call_count, 2)
+        sleep.assert_not_called()
+
+    def test_exhausted_rate_limit_preserves_cooldown_including_without_retries(self):
+        for retries in (0, 1):
+            with self.subTest(retries=retries):
+                client = self.client(retries=retries)
+                client.opener.open.side_effect = [HTTPError(
+                    'https://2026a.battlecode.co.uk/api/v1/ladder', 429, 'rate limited',
+                    {'Retry-After': '5'}, BytesIO(b'')) for _ in range(retries + 1)]
+                with patch.object(fetch_replays.time, 'sleep') as sleep, \
+                        patch.object(fetch_replays.time, 'monotonic', return_value=100):
+                    with self.assertRaises(fetch_replays.RateLimitError) as error:
+                        client.get_json('/api/v1/ladder')
+                    self.assertEqual(error.exception.retry_after, 5)
+                    with self.assertRaises(fetch_replays.RateLimitError):
+                        client.get_json('/api/v1/ladder')
+                self.assertEqual(client.opener.open.call_count, retries + 1)
+                self.assertEqual(sleep.call_args_list, [call(5)] * retries)
+
+    def test_short_rate_limit_retries_honor_header_and_succeed(self):
+        client = self.client(retries=1)
+        client.opener.open.side_effect = [HTTPError(
+            'https://2026a.battlecode.co.uk/api/v1/ladder', 429, 'rate limited',
+            {'Retry-After': '5'}, BytesIO(b'')), Response(b'{"teams":[]}')]
+        with patch.object(fetch_replays.time, 'sleep') as sleep:
+            self.assertEqual(client.get_json('/api/v1/ladder'), {'teams': []})
+        self.assertEqual(client.opener.open.call_count, 2)
+        sleep.assert_called_once_with(5)
+
+    def test_http_date_rate_limit_and_malformed_headers(self):
+        for header, expected in [('Thu, 01 Jan 1970 00:02:00 GMT', 120),
+                                 ('not a date', 1), ('nan', 1), ('inf', 1), ('0', 0)]:
+            with self.subTest(header=header):
+                client = self.client()
+                client.opener.open.side_effect = HTTPError(
+                    'https://2026a.battlecode.co.uk/api/v1/ladder', 429, 'rate limited',
+                    {'Retry-After': header}, BytesIO(b''))
+                with patch.object(fetch_replays.time, 'time', return_value=0), \
+                        patch.object(fetch_replays.time, 'sleep') as sleep:
+                    with self.assertRaises(fetch_replays.RateLimitError) as error:
+                        client.get_json('/api/v1/ladder')
+                self.assertEqual(error.exception.retry_after, expected)
+                sleep.assert_not_called()
+
+    def test_invalid_download_response_retries_and_replaces_all_partial_bytes(self):
+        for payload in (b'<html>Service temporarily unavailable</html>' * 10,
+                        REPLAY_HEADER, archive_bytes()[:-10], corrupt_archive_bytes()):
+            with self.subTest(payload=payload[:16]):
+                client = self.client(retries=1)
+                client.opener.open.side_effect = [Response(payload), Response(REPLAY_BYTES)]
+                with tempfile.TemporaryDirectory(prefix='fetch_client_tests_') as directory:
+                    destination = Path(directory) / 'replay.part'
+                    with patch.object(fetch_replays.time, 'sleep') as sleep:
+                        client.download('/api/v1/matches/x/bundle', destination)
+                    self.assertEqual(destination.read_bytes(), REPLAY_BYTES)
+                self.assertEqual(client.opener.open.call_count, 2)
+                sleep.assert_called_once_with(1)
+
+    def test_download_validation_and_http_failures_share_one_retry_budget(self):
+        client = self.client(retries=2)
+        valid_bundle = archive_bytes()
+        client.opener.open.side_effect = [
+            Response(b'<html>busy</html>'),
+            HTTPError('https://2026a.battlecode.co.uk/api/v1/matches/x/bundle',
+                      503, 'busy', {'Retry-After': '0'}, BytesIO(b'')),
+            Response(valid_bundle),
+        ]
+        with tempfile.TemporaryDirectory(prefix='fetch_client_tests_') as directory, \
+                patch.object(fetch_replays.time, 'sleep') as sleep:
+            destination = Path(directory) / 'replay.part'
+            client.download('/api/v1/matches/x/bundle', destination)
+            self.assertEqual(destination.read_bytes(), valid_bundle)
+        self.assertEqual(client.opener.open.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(1), call(0)])
+
+    def test_download_os_errors_are_not_retried(self):
+        client = self.client(retries=3)
+        client.opener.open.return_value = Response(REPLAY_BYTES)
+        with tempfile.TemporaryDirectory(prefix='fetch_client_tests_') as directory, \
+                patch.object(fetch_replays.time, 'sleep') as sleep:
+            with self.assertRaises(OSError):
+                client.download('/api/v1/matches/x/bundle', Path(directory) / 'missing' / 'replay.part')
+        self.assertEqual(client.opener.open.call_count, 1)
+        sleep.assert_not_called()
+
     def test_incomplete_download_is_retried_and_replaces_partial_bytes(self):
         client = self.client(retries=1)
         client.opener.open.side_effect = [
@@ -186,11 +297,14 @@ class ClientTests(unittest.TestCase):
             destination = Path(directory) / 'replay.part'
             for content_length in ('invalid', '-1'):
                 with self.subTest(content_length=content_length):
-                    client = self.client()
+                    client = self.client(retries=3)
                     client.opener.open.return_value = Response(
                         REPLAY_BYTES, {'Content-Length': content_length})
-                    with self.assertRaises(fetch_replays.FetchError):
-                        client.download('/api/v1/matches/187ad51c-b387-4db0-b9f5-157354de5398/bundle', destination)
+                    with patch.object(fetch_replays.time, 'sleep') as sleep:
+                        with self.assertRaises(fetch_replays.FetchError):
+                            client.download('/api/v1/matches/187ad51c-b387-4db0-b9f5-157354de5398/bundle', destination)
+                    self.assertEqual(client.opener.open.call_count, 1)
+                    sleep.assert_not_called()
                     self.assertFalse(destination.exists())
 
     def test_source_urls_select_ladder_team_and_match_group(self):
@@ -344,6 +458,12 @@ class ReplayFileTests(unittest.TestCase):
     def test_raw_replay_is_accepted(self):
         fetch_replays.validate_replay(self.file(REPLAY_BYTES))
 
+    def test_v2_transport_header_is_accepted(self):
+        replay = REPLAY_BYTES[:8] + b'\0\0\x02\0\0\x02' + REPLAY_BYTES[14:]
+        for payload in (replay, archive_bytes(replay)):
+            with self.subTest(bundled=payload != replay):
+                fetch_replays.validate_replay(self.file(payload))
+
     def test_bundle_member_is_accepted(self):
         fetch_replays.validate_replay(self.file(archive_bytes()))
 
@@ -424,6 +544,18 @@ class ReplayFileTests(unittest.TestCase):
         self.assertFalse(self.final_path().exists())
         self.assertEqual([path for path in self.outdir.rglob('*') if path.is_file()], [])
 
+    def test_exhausted_invalid_responses_leave_no_final_or_temp_file(self):
+        client = fetch_replays.Client(delay=0, retries=2)
+        client.opener = Mock()
+        client.opener.open.side_effect = [Response(b'<html>busy</html>') for _ in range(3)]
+        with patch.object(fetch_replays.time, 'sleep') as sleep:
+            with self.assertRaises(fetch_replays.FetchError):
+                fetch_replays.download_replay(client, self.record(), self.outdir)
+        self.assertEqual(client.opener.open.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(1), call(2)])
+        self.assertFalse(self.final_path().exists())
+        self.assertEqual([path for path in self.outdir.rglob('*') if path.is_file()], [])
+
     def test_untrusted_ids_cannot_escape_output_directory(self):
         for field in ('group_id', 'match_id'):
             record = self.record()
@@ -433,6 +565,26 @@ class ReplayFileTests(unittest.TestCase):
                 with self.assertRaises(fetch_replays.FetchError):
                     fetch_replays.download_replay(client, record, self.outdir)
                 self.assertFalse(client.downloads)
+
+
+class MainTests(unittest.TestCase):
+    def test_rate_limit_stops_before_selecting_another_replay(self):
+        selected = []
+
+        def records(*args):
+            for match_id in (MATCH, OTHER_MATCH):
+                selected.append(match_id)
+                yield {'group_id': GROUP, 'match_id': match_id}
+
+        with patch.object(fetch_replays, 'iter_replays', side_effect=records), \
+                patch.object(fetch_replays, 'download_replay') as download, \
+                patch.object(fetch_replays.sys, 'stdout'), \
+                patch.object(fetch_replays.sys, 'stderr'):
+            download.side_effect = fetch_replays.RateLimitError('retry after 120 seconds', 120)
+            result = fetch_replays.main(['--match-group', GROUP])
+        self.assertEqual(result, 1)
+        self.assertEqual(selected, [MATCH])
+        self.assertEqual(download.call_count, 1)
 
 
 class MetadataTests(unittest.TestCase):

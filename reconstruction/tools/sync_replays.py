@@ -201,11 +201,15 @@ def sync_once(client, catalog, *, max_pages=None, max_details=None, max_download
                 remaining_pages -= 1
             try:
                 stats["discovered"] += refresh_head(client, catalog, recent_ids)
+            except fetch.RateLimitError:
+                raise
             except (fetch.FetchError, OSError) as error:
                 stats["errors"] += 1
                 print(f"Current history failed; backfill checkpoint retained: {error}", file=sys.stderr)
     try:
         stats["discovered"] += discover(client, catalog, remaining_pages, full, recent_ids)
+    except fetch.RateLimitError:
+        raise
     except (fetch.FetchError, OSError) as error:
         stats["errors"] += 1
         print(f"Discovery failed; checkpoint retained: {error}", file=sys.stderr)
@@ -228,6 +232,8 @@ def sync_once(client, catalog, *, max_pages=None, max_details=None, max_download
             if not isinstance(group, dict) or fetch.identifier(group.get("id")) != group_id:
                 raise fetch.FetchError(f"Wrong detail response for group {group_id}")
             catalog.store_detail(data)
+        except fetch.RateLimitError:
+            raise
         except (fetch.FetchError, OSError) as error:
             stats["errors"] += 1
             print(f"Group {group_id}: {error}", file=sys.stderr)
@@ -265,6 +271,9 @@ def sync_once(client, catalog, *, max_pages=None, max_details=None, max_download
             stats["new_downloads"] += int(fresh)
             stats["existing"] += int(not fresh)
             print(f"{'Downloaded' if fresh else 'Indexed'}: {path}")
+        except fetch.RateLimitError as error:
+            catalog.mark_failed(record["match_id"], str(error))
+            raise
         except (fetch.FetchError, OSError) as error:
             catalog.mark_failed(record["match_id"], str(error))
             stats["errors"] += 1
