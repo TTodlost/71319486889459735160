@@ -268,6 +268,19 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(client.opener.open.call_count, 3)
         self.assertEqual(sleep.call_args_list, [call(1), call(0)])
 
+    def test_invalid_response_reports_header_fingerprint_and_http_encoding(self):
+        client = self.client()
+        payload = b'not a replay'
+        client.opener.open.return_value = Response(
+            payload, {'Content-Type': 'text/html', 'Content-Encoding': 'gzip'})
+        with tempfile.TemporaryDirectory(prefix='fetch_client_tests_') as directory:
+            with self.assertRaises(fetch_replays.FetchError) as caught:
+                client.download('/api/v1/matches/x/bundle', Path(directory) / 'replay.part')
+        self.assertIn(f'header={payload.hex()}', str(caught.exception))
+        self.assertIn('12 bytes', str(caught.exception))
+        self.assertIn("content-type='text/html'", str(caught.exception))
+        self.assertIn("content-encoding='gzip'", str(caught.exception))
+
     def test_download_os_errors_are_not_retried(self):
         client = self.client(retries=3)
         client.opener.open.return_value = Response(REPLAY_BYTES)

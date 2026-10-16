@@ -166,7 +166,10 @@ class Client:
             try:
                 validate_replay(destination)
             except FetchError as error:
-                raise _RetryableReplayResponse(str(error)) from error
+                content_type = str(response.headers.get("Content-Type", "unknown"))[:120]
+                content_encoding = str(response.headers.get("Content-Encoding", "identity"))[:120]
+                raise _RetryableReplayResponse(
+                    f"{error}; content-type={content_type!r}; content-encoding={content_encoding!r}") from error
         self._request(path, consume)
 
 
@@ -324,7 +327,9 @@ def validate_replay(path):
         header = replay.read(26)
         if (len(header) != 26 or header[:8] != REPLAY_MAGIC
                 or header[14:22] != MAP_MAGIC):
-            raise FetchError(f"{path}: invalid or truncated replay/map header")
+            raise FetchError(
+                f"{path}: invalid or truncated replay/map header "
+                f"({len(header)} bytes; header={header.hex()})")
 
     try:
         if zipfile.is_zipfile(path):
