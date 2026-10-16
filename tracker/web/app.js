@@ -1,7 +1,7 @@
 (() => {
   'use strict';
 
-  const defaults = {top: '20', minGames: '10', cohort: 'both', kind: 'ranked', champion: 'all', map: 'all', team: 'all', outcome: 'wins'};
+  const defaults = {top: '20', minGames: '10', cohort: 'both', kind: 'ranked', champion: 'all', map: 'all', team: 'all', outcome: 'wins', view: 'overall'};
   const state = {filters: {...defaults}, data: null, sort: 'eloGained', direction: -1, refreshing: false, lastCheck: null};
   const source = BattlecodeSnapshot.createSnapshotSource({url: new URL('./data.json', location.href).href, validate: BattlecodeStats.validateDataset});
   const $ = id => document.getElementById(id);
@@ -58,6 +58,7 @@
     if (!['both', 'either'].includes(next.cohort)) next.cohort = defaults.cohort;
     if (!['ranked', 'unranked', 'all'].includes(next.kind)) next.kind = defaults.kind;
     if (!['wins', 'losses', 'all'].includes(next.outcome)) next.outcome = defaults.outcome;
+    if (!['overall', 'maps'].includes(next.view)) next.view = defaults.view;
     if (next.champion !== 'all' && !/^\d+$/.test(next.champion)) next.champion = 'all';
     state.filters = next;
   }
@@ -66,9 +67,12 @@
     select.value = value;
   }
   function syncControls() {
-    for (const key of ['top', 'minGames', 'cohort', 'kind']) $(`filter-${key}`).value = state.filters[key];
+    for (const key of ['top', 'minGames', 'cohort', 'kind', 'view']) $(`filter-${key}`).value = state.filters[key];
     for (const key of ['champion', 'map', 'team']) ensureOption($(`filter-${key}`), state.filters[key]);
     document.querySelectorAll('input[name="outcome"]').forEach(input => { input.checked = input.value === state.filters.outcome; });
+    document.querySelectorAll('[data-view]').forEach(element => {
+      element.hidden = element.dataset.view !== (state.filters.view === 'maps' ? 'maps' : 'overall');
+    });
   }
   function updateURL() {
     const query = new URLSearchParams(state.filters);
@@ -252,6 +256,70 @@
       body.append(row);
     }
   }
+  function renderMapRates(containerId, maps, category, label, filter) {
+    const container = $(containerId);
+    container.replaceChildren();
+    const minimum = Number(state.filters.minGames);
+    const entities = new Map();
+    const samples = maps.map(map => new Map(map[category].map(row => [row.id, row])));
+    for (const map of maps) for (const row of map[category]) {
+      if (row.games >= minimum) entities.set(row.id, row);
+    }
+    if (!entities.size) {
+      container.append(make('p', 'empty-cell', `No ${label.toLowerCase()} win rates meet the minimum sample on any selected map. Lower minimum appearances or broaden the filters.`));
+      return;
+    }
+    const scroll = make('div', 'table-scroll map-scroll');
+    scroll.tabIndex = 0;
+    scroll.setAttribute('role', 'region');
+    scroll.setAttribute('aria-label', `${label} win rates by map; scroll horizontally for more maps`);
+    const table = make('table', 'map-rate-table');
+    table.append(make('caption', 'sr-only', `${label} win rates by map. Each sample is wins divided by appearances on that map. Rates below ${minimum} appearances are hidden.`));
+    const head = make('thead');
+    const header = make('tr');
+    const identity = make('th', '', label);
+    identity.scope = 'col';
+    header.append(identity);
+    for (const map of maps) {
+      const cell = make('th');
+      cell.scope = 'col';
+      const button = make('button', 'map-name-button', humanize(map.map));
+      button.type = 'button';
+      button.title = `Show only ${humanize(map.map)}`;
+      button.addEventListener('click', () => changeFilter('map', map.map));
+      cell.append(button, make('span', 'th-detail', `${count(map.games)} matches`));
+      header.append(cell);
+    }
+    head.append(header);
+    const body = make('tbody');
+    for (const entity of [...entities.values()].sort((a, b) => a.name.localeCompare(b.name) || String(a.id).localeCompare(String(b.id)))) {
+      const row = make('tr');
+      const cell = make('th', 'map-identity');
+      cell.scope = 'row';
+      if (filter) {
+        const selected = state.filters[filter] === String(entity.id);
+        const button = make('button', `team-name-button${selected ? ' selected' : ''}`, entity.name);
+        button.type = 'button';
+        button.setAttribute('aria-pressed', String(selected));
+        button.title = `Filter statistics to ${entity.name}`;
+        button.addEventListener('click', () => changeFilter(filter, selected ? 'all' : entity.id));
+        cell.append(button);
+      } else cell.textContent = humanize(entity.name);
+      row.append(cell);
+      for (const sample of samples) {
+        const stats = sample.get(entity.id);
+        const eligible = stats && stats.games >= minimum;
+        const rateCell = renderRateCell(eligible ? stats.winRate : null, stats?.wins ?? 0, stats?.games ?? 0, eligible ? (stats.winRate >= 50 ? 'map-positive' : 'map-negative') : 'map-insufficient');
+        rateCell.title = !stats ? 'No appearances on this map.' : !eligible ? `Below minimum ${minimum} appearances on this map.` : `${count(stats.wins)} wins / ${count(stats.games)} appearances on this map.`;
+        row.append(rateCell);
+      }
+      body.append(row);
+    }
+    table.append(head, body);
+    scroll.append(table);
+    container.append(scroll);
+    container.append(make('div', 'panel-foot map-foot', `Wins / appearances · both outcomes · minimum ${count(minimum)} appearances per map. Select a map heading to focus on it.`));
+  }
   function renderMatchups(data) {
     const minimum = Number(state.filters.minGames);
     const pairs = (data.synergies || []).filter(row => row.games >= minimum);
@@ -318,6 +386,9 @@
     const coverage = BattlecodeStats.snapshotCoverage(source.current);
     const observations = number(detail.observations) ?? 0;
     const selected = state.filters.champion === 'all' ? 'All champions' : detail.championName || (data.options?.champions || []).find(champion => String(champion.id) === state.filters.champion)?.name || 'Selected champion';
+    const byMap = state.filters.view === 'maps';
+    text('ranking-note', byMap ? 'Minimum applies to each champion, item and team on each map. Cells show win rate and wins / appearances.' : 'Applies to champion and matchup rankings. Item rates retain the full selected sample.');
+    text('champions-description', byMap ? 'Compare win rates across maps. Select a champion to explore its item win rates below.' : 'Ranked by apportioned actual Elo gained. Select a champion to explore its items, teammates and opponents.');
     text('snapshot-date', coverage.latestMatchAt ? fullDate(coverage.latestMatchAt) : 'No matches published in this window');
     text('archive-size', `${count(coverage.games)} maps in published partial sample`);
     text('leaderboard-date', fullDate(coverage.leaderboardUpdatedAt));
@@ -332,12 +403,13 @@
     text('summary-teams', count(summary.uniqueTeams));
     text('summary-period', summary.start ? `${fullDate(summary.start)} — ${fullDate(summary.end)}` : 'No matches in this sample');
     text('summary-rank', `Current leaderboard top ${state.filters.top}`);
-    text('summary-detail', count(observations));
-    text('summary-detail-label', `BUILD SAMPLE · ${outcomeName().toUpperCase()}`);
+    const championAppearances = (data.champions || []).filter(champion => state.filters.champion === 'all' || String(champion.id) === state.filters.champion).reduce((total, champion) => total + champion.games, 0);
+    text('summary-detail', count(byMap ? championAppearances : observations));
+    text('summary-detail-label', byMap ? 'CHAMPION SAMPLE · BOTH OUTCOMES' : `BUILD SAMPLE · ${outcomeName().toUpperCase()}`);
     text('summary-detail-caption', `${selected === 'All champions' ? 'All champion' : selected} appearances`);
     text('cohort-caption', state.filters.cohort === 'both' ? `Both sides are in the published current leaderboard’s top ${state.filters.top}.` : `At least one current top ${state.filters.top} side; only those qualifying sides contribute observations.`);
     text('selected-champion-name', selected);
-    text('item-denominator', `${count(observations)} champion appearances · ${outcomeName()} · purchase and inventory rates use this denominator.`);
+    text('item-denominator', byMap ? 'Per-map wins / appearances buying or finishing with the item. Both outcomes; descriptive, not causal.' : `${count(observations)} champion appearances · ${outcomeName()} · purchase and inventory rates use this denominator.`);
     const games = number(summary.games) ?? 0;
     $('sample-warning').hidden = games >= 100;
     text('sample-warning', games === 0 ? 'No qualifying maps. Broaden the Elo cohort or change the queue, map or team.' : `Limited sample · ${count(games)} maps. Repeated maps from a series are correlated; rates are preliminary.`);
@@ -363,6 +435,11 @@
     renderTeams(data.teamRows || []);
     renderMatchups(data);
     renderMatches(data.recentMatches || []);
+    if (byMap) {
+      renderMapRates('champion-map-rates', data.mapStats || [], 'champions', 'Champion', 'champion');
+      renderMapRates('item-map-rates', data.mapStats || [], 'items', 'Item');
+      renderMapRates('team-map-rates', data.mapStats || [], 'teams', 'Team', 'team');
+    }
   }
   function loadStats() {
     if (!source.current) return;
@@ -414,6 +491,7 @@
         text('archive-size', 'Check for updates to retry');
         for (const [id, columns] of [['champion-body', 10], ['item-body', 7], ['team-body', 7], ['synergy-body', 4], ['antisynergy-body', 4], ['counter-body', 5]]) empty($(id), columns, 'Statistics unavailable. Check for updates to retry.');
         for (const id of ['build-list', 'consumable-list', 'match-list']) $(id).replaceChildren(make('p', 'empty-cell', 'Statistics unavailable.'));
+        for (const id of ['champion-map-rates', 'item-map-rates', 'team-map-rates']) $(id).replaceChildren(make('p', 'empty-cell', 'Statistics unavailable. Check for updates to retry.'));
       }
     } finally {
       state.refreshing = false;
@@ -427,7 +505,7 @@
     }
   }
   $('filters').addEventListener('submit', event => event.preventDefault());
-  for (const key of ['cohort', 'kind', 'map', 'team', 'champion']) $(`filter-${key}`).addEventListener('change', event => changeFilter(key, event.target.value));
+  for (const key of ['cohort', 'kind', 'map', 'team', 'champion', 'view']) $(`filter-${key}`).addEventListener('change', event => changeFilter(key, event.target.value));
   for (const [key, minimum] of [['top', 1], ['minGames', 0]]) {
     const input = $(`filter-${key}`);
     const apply = () => {

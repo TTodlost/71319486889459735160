@@ -62,9 +62,10 @@ def aggregate(data, query=None):
         raise ValueError('minGames must be an integer between 0 and 10000')
     filters = {'top': top, 'minGames': minimum, 'cohort': q.get('cohort', 'both'), 'kind': q.get('kind', 'ranked'),
                'champion': q.get('champion', 'all'), 'map': q.get('map', 'all'),
-               'team': q.get('team', 'all'), 'outcome': q.get('outcome', 'wins')}
+               'team': q.get('team', 'all'), 'outcome': q.get('outcome', 'wins'),
+               'view': q.get('view', 'overall')}
     for key, allowed in [('cohort', ('both', 'either')), ('kind', ('ranked', 'unranked', 'all')),
-                         ('outcome', ('wins', 'losses', 'all'))]:
+                         ('outcome', ('wins', 'losses', 'all')), ('view', ('overall', 'maps'))]:
         if filters[key] not in allowed:
             raise ValueError(f'Invalid {key} filter')
     if filters['champion'] != 'all':
@@ -195,6 +196,42 @@ def aggregate(data, query=None):
                   'wins': sum(t['win'] for t in values), 'winRate': percentage(sum(t['win'] for t in values), len(values))}
                  for tid, values in teams.items()]
     team_rows.sort(key=lambda row: (-row['games'], row['name']))
+    map_stats = []
+    if filters['view'] == 'maps':
+        grouped = {}
+        for match in games:
+            if match['map'] not in grouped:
+                grouped[match['map']] = {'map': match['map'], 'games': 0,
+                                         'champions': {}, 'items': {}, 'teams': {}}
+            grouped[match['map']]['games'] += 1
+
+        def record_map_entity(bucket, identifier, name, win):
+            if identifier not in bucket:
+                bucket[identifier] = {'id': identifier, 'name': name, 'games': 0, 'wins': 0}
+            bucket[identifier]['games'] += 1
+            bucket[identifier]['wins'] += win
+
+        for match, team in observations:
+            group = grouped[match['map']]
+            record_map_entity(group['teams'], team['id'],
+                              leaderboard[team['id']].get('name', team['name']), team['win'])
+            for champion in team['champions']:
+                definition = definitions[champion['type']]
+                record_map_entity(group['champions'], definition['id'], definition['name'], team['win'])
+                if selected_id is not None and champion['type'] != selected_id:
+                    continue
+                # Use both outcomes and count a purchase/final-inventory overlap only once.
+                for item in data['items']:
+                    identifier = item['id']
+                    if champion['rawItemBuys'][identifier] or champion['items'][identifier]:
+                        record_map_entity(group['items'], identifier, item['name'], team['win'])
+        for map_name in sorted(grouped):
+            group = grouped[map_name]
+            for category in ('champions', 'items', 'teams'):
+                group[category] = [dict(row, winRate=percentage(row['wins'], row['games']))
+                                   for row in sorted(group[category].values(),
+                                                     key=lambda row: (row['name'], row['id']))]
+            map_stats.append(group)
     recent = []
     for match in sorted(games, key=lambda m: m['startedAt'], reverse=True)[:50]:
         recent.append({k: match[k] for k in ('id', 'url', 'map', 'startedAt', 'rounds')})
@@ -212,7 +249,7 @@ def aggregate(data, query=None):
                     'end': max((m['startedAt'] for m in games), default=None)},
         'champions': champion_rows, 'items': item_rows, 'consumables': consumables,
         'synergies': synergies, 'counters': counters,
-        'builds': build_rows[:25], 'teamRows': team_rows, 'recentMatches': recent,
+        'builds': build_rows[:25], 'teamRows': team_rows, 'mapStats': map_stats, 'recentMatches': recent,
         'options': {'maps': sorted({m['map'] for m in data['matches']}),
                     'teams': [{'id': tid, 'name': name} for tid, name in sorted(all_teams.items(), key=lambda kv: kv[1])],
                     'champions': data['champions']},

@@ -60,8 +60,9 @@
     const minGames = integer(minimum);
     if (minGames < 0 || minGames > 10000) throw new Error('minGames must be between 0 and 10000');
     const filters = {top, minGames, cohort: query.cohort ?? 'both', kind: query.kind ?? 'ranked',
-      champion: query.champion ?? 'all', map: query.map ?? 'all', team: query.team ?? 'all', outcome: query.outcome ?? 'wins'};
-    for (const [key, allowed] of [['cohort', ['both', 'either']], ['kind', ['ranked', 'unranked', 'all']], ['outcome', ['wins', 'losses', 'all']]]) {
+      champion: query.champion ?? 'all', map: query.map ?? 'all', team: query.team ?? 'all', outcome: query.outcome ?? 'wins',
+      view: Object.hasOwn(query, 'view') ? query.view : 'overall'};
+    for (const [key, allowed] of [['cohort', ['both', 'either']], ['kind', ['ranked', 'unranked', 'all']], ['outcome', ['wins', 'losses', 'all']], ['view', ['overall', 'maps']]]) {
       if (!allowed.includes(filters[key])) throw new Error(`Invalid ${key} filter`);
     }
     const championId = filters.champion === 'all' ? null : integer(filters.champion);
@@ -134,6 +135,41 @@
       currentRank: leaderboard.get(id).rank, currentElo: leaderboard.get(id).rating ?? null,
       wins: sum(values, team => team.win), winRate: percentage(sum(values, team => team.win), values.length)}))
       .sort((a, b) => b.games - a.games || compareText(a.name, b.name));
+    const mapStats = [];
+    if (filters.view === 'maps') {
+      const grouped = new Map();
+      for (const match of games) {
+        if (!grouped.has(match.map)) grouped.set(match.map, {map: match.map, games: 0, champions: new Map(), items: new Map(), teams: new Map()});
+        grouped.get(match.map).games++;
+      }
+      const championNames = new Map(data.champions.map(champion => [champion.id, champion.name]));
+      const recordMapEntity = (bucket, id, name, win) => {
+        if (!bucket.has(id)) bucket.set(id, {id, name, games: 0, wins: 0});
+        const row = bucket.get(id);
+        row.games++;
+        row.wins += Number(win);
+      };
+      for (const {match, team} of observations) {
+        const group = grouped.get(match.map);
+        recordMapEntity(group.teams, team.id, leaderboard.get(team.id).name ?? team.name, team.win);
+        for (const champion of team.champions) {
+          recordMapEntity(group.champions, champion.type, championNames.get(champion.type), team.win);
+          if (championId !== null && champion.type !== championId) continue;
+          // Use both outcomes and count a purchase/final-inventory overlap only once.
+          for (const item of data.items) {
+            if (champion.rawItemBuys[item.id] || champion.items[item.id]) recordMapEntity(group.items, item.id, item.name, team.win);
+          }
+        }
+      }
+      const entityRows = (bucket, numericIds) => [...bucket.values()]
+        .map(row => ({...row, winRate: percentage(row.wins, row.games)}))
+        .sort((a, b) => compareText(a.name, b.name) || (numericIds ? a.id - b.id : compareText(a.id, b.id)));
+      for (const map of [...grouped.keys()].sort(compareText)) {
+        const group = grouped.get(map);
+        mapStats.push({map, games: group.games, champions: entityRows(group.champions, true),
+          items: entityRows(group.items, true), teams: entityRows(group.teams, false)});
+      }
+    }
     const recent = [...games].sort((a, b) => compareText(b.startedAt, a.startedAt)).slice(0, 50).map(match => ({
       id: match.id, url: match.url, map: match.map, startedAt: match.startedAt, rounds: match.rounds,
       teams: match.teams.map(team => ({name: team.name, rank: team.rank, rankMin: team.rankMin, rankMax: team.rankMax, elo: team.elo, win: team.win,
@@ -178,7 +214,7 @@
     }).sort((a, b) => b.games - a.games || a.champion.id - b.champion.id || a.opponent.id - b.opponent.id);
     return {meta: data.meta, filters,
       summary: {games: games.length, teamObservations: observations.length, uniqueTeams: teams.size, start: times[0] ?? null, end: times.at(-1) ?? null},
-      champions: championRows, items: itemRows, consumables, builds: buildRows.slice(0, 25), teamRows, recentMatches: recent, synergies, counters,
+      champions: championRows, items: itemRows, consumables, builds: buildRows.slice(0, 25), teamRows, mapStats, recentMatches: recent, synergies, counters,
       options: {maps: [...new Set(data.matches.map(match => match.map))].sort(compareText),
         teams: [...allTeams].sort((a, b) => compareText(a[1], b[1])).map(([id, name]) => ({id, name})), champions: data.champions},
       detail: {observations: denominator, championName: data.champions.find(champion => String(champion.id) === filters.champion)?.name ?? 'All champions'}};

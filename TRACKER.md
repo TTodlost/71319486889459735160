@@ -26,6 +26,12 @@ cached between builds; old archive progress cannot block fresh statistics.
 
 ## Metrics
 
+- **Win rates → By map** compares champion, item and team results across maps.
+  Each cell shows the win rate and wins / appearances from both outcomes.
+  Minimum appearances applies separately to each entity on each map; cells
+  below it show a dash. Existing cohort, queue, map and team filters apply.
+  Select a champion to narrow item samples, or a map heading to focus on it.
+  Set the minimum to zero to see small samples.
 - Champion win rate includes both outcomes and mirror picks. Minimum appearances
   controls the ranking display and can be set to zero to show every sample.
 - **Elo gained** uses actual ranked-series `ratingAfter − ratingBefore`, divided by
