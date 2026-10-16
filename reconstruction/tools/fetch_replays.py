@@ -17,6 +17,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+from threading import Lock
 import time
 from typing import Iterator
 from urllib.error import HTTPError, URLError
@@ -32,6 +33,9 @@ REPLAY_MAGIC = b"a62per\0\0"
 MAP_MAGIC = b"w62pam\0\0"
 MAX_PENDING_POLLS = 12
 PENDING_TIMEOUT = 60
+DEFAULT_REQUEST_DELAY = 1.0
+RATE_LIMIT_BACKOFF = 15
+MAX_RATE_LIMIT_BACKOFF = 120
 
 
 class FetchError(RuntimeError):
@@ -80,8 +84,48 @@ def identifier(value: str) -> str:
         raise FetchError(f"Invalid Battlecode ID: {value!r}") from error
 
 
+class RequestPacer:
+    """Space actual HTTP attempts and share server cooldowns across clients."""
+
+    def __init__(self, delay=DEFAULT_REQUEST_DELAY):
+        self.delay = delay
+        self._lock = Lock()
+        self._next_request = 0.0
+        self._cooldown_until = 0.0
+        self._defer_until = 0.0
+
+    def cooldown(self, seconds, *, defer=False):
+        with self._lock:
+            until = time.monotonic() + seconds
+            self._cooldown_until = max(self._cooldown_until, until)
+            if defer:
+                self._defer_until = max(self._defer_until, until)
+
+    def wait(self, deadline=None):
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                remaining = self._defer_until - now
+                if remaining > 0:
+                    raise RateLimitError(
+                        f"Rate limited; retry after {math.ceil(remaining)} seconds", remaining)
+                pause = max(0, self._next_request - now, self._cooldown_until - now)
+                if deadline is not None and now + pause >= deadline:
+                    remaining = self._cooldown_until - now
+                    if remaining > 0:
+                        raise RateLimitError(
+                            f"Rate limited; retry after {math.ceil(remaining)} seconds", remaining)
+                    raise FetchError("Replay bundle is still pending; retry later")
+                if pause <= 0:
+                    self._next_request = now + self.delay
+                    return
+            # Recheck after sleeping: a peer may have received a longer cooldown.
+            time.sleep(pause)
+
+
 class Client:
-    def __init__(self, base_url=DEFAULT_BASE_URL, timeout=30, delay=.25, retries=3):
+    def __init__(self, base_url=DEFAULT_BASE_URL, timeout=30,
+                 delay=DEFAULT_REQUEST_DELAY, retries=3, *, pacer=None):
         parsed = urlsplit(base_url)
         if (parsed.scheme not in ("http", "https") or not parsed.netloc
                 or parsed.username or parsed.password or parsed.query or parsed.fragment
@@ -92,8 +136,7 @@ class Client:
         self.delay = delay
         self.retries = retries
         self.opener = build_opener()
-        self.last_request = 0.0
-        self._rate_limit_until = 0.0
+        self.pacer = pacer if pacer is not None else RequestPacer(delay)
 
     def url(self, path: str) -> str:
         resolved = urljoin(self.base_url + "/", path)
@@ -108,29 +151,25 @@ class Client:
     def _retry_delay(self, error, attempt: int) -> float:
         header = error.headers.get("Retry-After") if isinstance(error, HTTPError) else None
         wait = _parse_retry_after(header)
+        if isinstance(error, HTTPError) and error.code == 429:
+            return max(0 if wait is None else wait,
+                       min(RATE_LIMIT_BACKOFF * 2 ** attempt, MAX_RATE_LIMIT_BACKOFF))
         return max(0, min(2 ** attempt, 10) if wait is None else wait)
 
     def _request(self, path, consume):
         original_url = url = self.url(path)
-        remaining = self._rate_limit_until - time.monotonic()
-        if remaining > 0:
-            raise RateLimitError(f"Rate limited; retry after {math.ceil(remaining)} seconds", remaining)
         attempt = pending_polls = 0
         pending_deadline = None
         poll_url = None
         poll_fallback_used = False
         while attempt <= self.retries:
-            now = time.monotonic()
-            pause = max(0, self.delay - (now - self.last_request))
+            self.pacer.wait(pending_deadline)
             timeout = self.timeout
             if pending_deadline is not None:
-                remaining = pending_deadline - now
-                if remaining <= pause:
+                remaining = pending_deadline - time.monotonic()
+                if remaining <= 0:
                     raise FetchError("Replay bundle is still pending; retry later")
-                timeout = min(timeout, remaining - pause)
-            if pause > 0:
-                time.sleep(pause)
-            self.last_request = time.monotonic()
+                timeout = min(timeout, remaining)
             try:
                 request = Request(url, headers={"User-Agent": "cambc-replay-fetcher/1.0",
                                                "Accept": "application/json, application/zip, */*"})
@@ -160,9 +199,10 @@ class Client:
                 elif error.code == 429:
                     wait = self._retry_delay(error, attempt)
                     retry_until = time.monotonic() + wait
-                    if (attempt == self.retries or wait > 60
-                            or pending_deadline is not None and retry_until >= pending_deadline):
-                        self._rate_limit_until = retry_until
+                    defer = (attempt == self.retries or wait > 60
+                             or pending_deadline is not None and retry_until >= pending_deadline)
+                    self.pacer.cooldown(wait, defer=defer)
+                    if defer:
                         raise RateLimitError(
                             f"HTTP 429 for {url}; retry after {math.ceil(wait)} seconds", wait) from error
                 elif error.code not in (500, 502, 503, 504) or attempt == self.retries:
@@ -542,7 +582,8 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="list replay URLs without writing files")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--timeout", type=nonnegative_float, default=30)
-    parser.add_argument("--delay", type=nonnegative_float, default=.25, help="minimum seconds between requests (default: .25)")
+    parser.add_argument("--delay", type=nonnegative_float, default=DEFAULT_REQUEST_DELAY,
+                        help="minimum seconds between HTTP attempts (default: 1)")
     parser.add_argument("--retries", type=int, default=3,
                         help="retries for transient HTTP/network failures or invalid replay responses (default: 3)")
     args = parser.parse_args(argv)

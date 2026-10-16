@@ -325,7 +325,7 @@ def main(argv=None):
     parser.add_argument("--full", action="store_true", help="rescan all history, preserving existing replays")
     parser.add_argument("--watch", type=fetch.nonnegative_float, help="repeat sync every N seconds until interrupted")
     parser.add_argument("--timeout", type=fetch.nonnegative_float, default=30)
-    parser.add_argument("--delay", type=fetch.nonnegative_float, default=.25)
+    parser.add_argument("--delay", type=fetch.nonnegative_float, default=fetch.DEFAULT_REQUEST_DELAY)
     parser.add_argument("--retries", type=nonnegative_int, default=3)
     parser.add_argument("--list", action="store_true", help="query the local catalog without network access")
     parser.add_argument("--team", help="filter --list by team ID or exact historical name")

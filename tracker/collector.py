@@ -11,8 +11,6 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
-from threading import Lock
-import time
 import uuid
 
 from replay_extract import decode, ITEMS, CHAMPIONS, ITEM_DESIGNS, CONSUMABLE_DESIGNS
@@ -21,7 +19,7 @@ from rankings import RatingIndex
 ROOT = Path(__file__).resolve().parent
 WORKSPACE = ROOT.parent
 sys.path.insert(0, str(WORKSPACE / 'reconstruction/tools'))
-from fetch_replays import Client, iter_ladder, download_replay, write_metadata
+from fetch_replays import Client, RequestPacer, iter_ladder, download_replay, write_metadata
 from replay_catalog import Catalog
 from github_replay_state import GitHubApi, trusted_artifacts
 from replay_snapshot import restore_snapshot
@@ -69,7 +67,8 @@ def recent_groups(client, team_id, start, end, limit=SERIES_PER_TEAM):
 
 def collect_current(progress=print, now=None):
     """Fetch current leaders' recent series before considering any old archive."""
-    client = Client(delay=.25, timeout=20, retries=2)
+    pacer = RequestPacer()
+    client = Client(timeout=20, retries=3, pacer=pacer)
     ladder = [{'teamId': t['teamId'], 'name': t['name'], 'rank': t['rank'], 'rating': t.get('rating')}
               for t in iter_ladder(client) if type(t.get('rank')) is int and t['rank'] >= 1]
     leaders = [t for t in ladder if t['rank'] <= COLLECTION_TOP]
@@ -106,27 +105,15 @@ def collect_current(progress=print, now=None):
         records = {r['match_id']: r for r in catalog.replay_records() if r['match_id'] in match_ids}
         if len(records) != len(match_ids) or not records:
             raise ValueError('No complete recent replay records were found.')
-        rate_lock = Lock()
-        next_request = [0.0]
-
-        class DownloadClient(Client):
-            def _request(self, path, consume):
-                with rate_lock:
-                    instant = time.monotonic()
-                    delay = max(0, next_request[0] - instant)
-                    next_request[0] = max(instant, next_request[0]) + .2
-                if delay:
-                    time.sleep(delay)
-                return super()._request(path, consume)
 
         def download(record):
-            c = DownloadClient(delay=0, timeout=20, retries=2)
+            c = Client(timeout=20, retries=3, pacer=pacer)
             path, _ = download_replay(c, record, archive)
             public_record = {k: v for k, v in record.items() if k not in ('file_path', 'downloaded', 'error', 'sha256', 'byte_size')}
             metadata = write_metadata(c, public_record, path, expected_sha256=record.get('sha256'))
             return record['match_id'], path, metadata
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=2) as pool:
             tasks = [pool.submit(download, r) for r in records.values()]
             try:
                 for number, task in enumerate(as_completed(tasks), 1):
@@ -205,7 +192,8 @@ def latest_snapshot(progress=print):
 
 
 def fetch_histories(archive, start, end, progress=print):
-    client = Client(delay=.25, timeout=20, retries=2)
+    pacer = RequestPacer()
+    client = Client(timeout=20, retries=3, pacer=pacer)
     ladder = list(iter_ladder(client))
     db = sqlite3.connect(f'file:{(archive / "catalog.sqlite3").resolve().as_posix()}?mode=ro', uri=True)
     try:
@@ -218,29 +206,18 @@ def fetch_histories(archive, start, end, progress=print):
     directory = archive.parent / 'histories'
     directory.mkdir(exist_ok=True)
     atomic_json(archive.parent / 'ladder.json', ladder)
-    rate_lock = Lock()
-    next_request = [0.0]
-
-    def request(c, params):
-        with rate_lock:
-            now = time.monotonic()
-            delay = max(0, next_request[0] - now)
-            next_request[0] = max(now, next_request[0]) + .2
-        if delay:
-            time.sleep(delay)
-        return c.get_json('/api/v1/match-groups', params)
 
     def fetch(tid):
         path = directory / (tid + '.json')
         # Histories are evidence snapshots, not immutable per-artifact cache.
         # A prior attempt may have been rejected for pending or missing events;
         # always re-query them until the complete dataset has been published.
-        c = Client(delay=0, timeout=20, retries=2)
+        c = Client(timeout=20, retries=3, pacer=pacer)
         params = {'scope': 'all', 'kind': 'ranked', 'team': tid, 'before': before}
         groups = {}
         seen_cursors = set()
         while True:
-            response = request(c, params)
+            response = c.get_json('/api/v1/match-groups', params)
             page = response['groups']
             for g in page:
                 groups[g['id']] = g
@@ -263,7 +240,7 @@ def fetch_histories(archive, start, end, progress=print):
     while ids:
         pending = sorted(ids - fetched)
         ids = set()
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=2) as pool:
             tasks = {pool.submit(fetch, tid): tid for tid in pending}
             try:
                 for result in as_completed(tasks):

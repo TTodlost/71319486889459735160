@@ -365,7 +365,7 @@ def run_sync(outdir, seconds=180, max_pages=20, max_details=40, max_downloads=10
     script = Path(__file__).with_name("sync_replays.py")
     command = [sys.executable, str(script), "--outdir", str(Path(outdir)), "--max-pages", str(max_pages),
                "--max-details", str(max_details), "--max-downloads", str(max_downloads),
-               "--timeout", "15", "--delay", "0.25", "--retries", "1"]
+               "--timeout", "15", "--delay", "1", "--retries", "3"]
     options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
     child = subprocess.Popen(command, **options)
     reaped = False

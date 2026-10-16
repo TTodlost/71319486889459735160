@@ -437,7 +437,8 @@ class DeadlineTests(unittest.TestCase):
         self.assertEqual(result, 3)
         child.wait.assert_called_once_with(timeout=17)
         command = launch.call_args.args[0]
-        for flag, value in (('--max-pages', '4'), ('--max-details', '5'), ('--max-downloads', '6')):
+        for flag, value in (('--max-pages', '4'), ('--max-details', '5'), ('--max-downloads', '6'),
+                            ('--delay', '1'), ('--retries', '3')):
             self.assertEqual(command[command.index(flag) + 1], value)
         child.send_signal.assert_not_called()
         child.terminate.assert_not_called()

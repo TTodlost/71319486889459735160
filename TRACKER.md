@@ -30,6 +30,11 @@ waiting before deferring the download. Pending JSON is never saved as a replay.
 If the job URL returns 404, it rechecks the original bundle URL once within the
 same retry budget. Invalid responses also share that budget. A persistent HTTP 429
 stops the archive pass while retaining its checkpoint and remaining download queue.
+HTTP attempts are spaced at least one second apart, including retries and job
+polls. The tracker shares this pacing and server cooldowns across its two download
+workers. HTTP 429 retries wait at least 15, 30, then 60 seconds, honoring longer
+`Retry-After` values; both collectors allow three retries. Cooldowns longer than
+60 seconds or beyond a pending job's deadline defer the work to a later pass.
 
 ## Metrics
 

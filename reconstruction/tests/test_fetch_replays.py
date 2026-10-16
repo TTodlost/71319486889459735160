@@ -114,6 +114,17 @@ def pending_response(*, retry_after=5, headers=None, **fields):
                                               **(headers or {})}, status=202)
 
 
+class Clock:
+    def __init__(self):
+        self.now = 100.0
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def monotonic(self):
+        return self.now
+
+
 class ClientTests(unittest.TestCase):
     def client(self, *, retries=0):
         client = fetch_replays.Client(delay=0, retries=retries)
@@ -214,29 +225,54 @@ class ClientTests(unittest.TestCase):
                 client.opener.open.side_effect = [HTTPError(
                     'https://2026a.battlecode.co.uk/api/v1/ladder', 429, 'rate limited',
                     {'Retry-After': '5'}, BytesIO(b'')) for _ in range(retries + 1)]
-                with patch.object(fetch_replays.time, 'sleep') as sleep, \
-                        patch.object(fetch_replays.time, 'monotonic', return_value=100):
+                clock = Clock()
+                with patch.object(fetch_replays.time, 'sleep', side_effect=clock.sleep) as sleep, \
+                        patch.object(fetch_replays.time, 'monotonic', side_effect=clock.monotonic):
                     with self.assertRaises(fetch_replays.RateLimitError) as error:
                         client.get_json('/api/v1/ladder')
-                    self.assertEqual(error.exception.retry_after, 5)
+                    self.assertEqual(error.exception.retry_after, 15 * 2 ** retries)
                     with self.assertRaises(fetch_replays.RateLimitError):
                         client.get_json('/api/v1/ladder')
                 self.assertEqual(client.opener.open.call_count, retries + 1)
-                self.assertEqual(sleep.call_args_list, [call(5)] * retries)
+                self.assertEqual(sleep.call_args_list, [call(15)] * retries)
 
     def test_short_rate_limit_retries_honor_header_and_succeed(self):
         client = self.client(retries=1)
         client.opener.open.side_effect = [HTTPError(
             'https://2026a.battlecode.co.uk/api/v1/ladder', 429, 'rate limited',
             {'Retry-After': '5'}, BytesIO(b'')), Response(b'{"teams":[]}')]
-        with patch.object(fetch_replays.time, 'sleep') as sleep:
+        clock = Clock()
+        with patch.object(fetch_replays.time, 'sleep', side_effect=clock.sleep) as sleep, \
+                patch.object(fetch_replays.time, 'monotonic', side_effect=clock.monotonic):
             self.assertEqual(client.get_json('/api/v1/ladder'), {'teams': []})
         self.assertEqual(client.opener.open.call_count, 2)
-        sleep.assert_called_once_with(5)
+        sleep.assert_called_once_with(15)
+
+    def test_repeated_rate_limits_increase_backoff_despite_short_server_hint(self):
+        client = self.client(retries=3)
+        client.opener.open.side_effect = [HTTPError(
+            client.url('/api/v1/ladder'), 429, 'rate limited', {'Retry-After': '5'}, BytesIO(b''))
+            for _ in range(3)] + [Response(b'{"teams":[]}')]
+        clock = Clock()
+        with patch.object(fetch_replays.time, 'sleep', side_effect=clock.sleep) as sleep, \
+                patch.object(fetch_replays.time, 'monotonic', side_effect=clock.monotonic):
+            self.assertEqual(client.get_json('/api/v1/ladder'), {'teams': []})
+        self.assertEqual(client.opener.open.call_count, 4)
+        self.assertEqual(sleep.call_args_list, [call(15), call(30), call(60)])
+
+    def test_rate_limit_backoff_honors_larger_server_hint_and_caps_own_exponent(self):
+        client = self.client()
+        for attempt, header, expected in ((0, '40', 40), (1, '40', 40),
+                                          (8, '5', 120), (8, '300', 300)):
+            with self.subTest(attempt=attempt, header=header):
+                error = HTTPError(client.url('/api/v1/ladder'), 429, 'rate limited',
+                                  {'Retry-After': header}, BytesIO(b''))
+                self.assertEqual(client._retry_delay(error, attempt), expected)
+                error.close()
 
     def test_http_date_rate_limit_and_malformed_headers(self):
         for header, expected in [('Thu, 01 Jan 1970 00:02:00 GMT', 120),
-                                 ('not a date', 1), ('nan', 1), ('inf', 1), ('0', 0)]:
+                                 ('not a date', 15), ('nan', 15), ('inf', 15), ('0', 15)]:
             with self.subTest(header=header):
                 client = self.client()
                 client.opener.open.side_effect = HTTPError(
@@ -342,6 +378,98 @@ class ClientTests(unittest.TestCase):
         for source, expected in cases:
             with self.subTest(source=source):
                 self.assertEqual(fetch_replays.parse_source(client, source), expected)
+
+
+class RequestPacerTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.pacer = fetch_replays.RequestPacer(delay=1)
+        self.enterContext(patch.object(fetch_replays.time, 'monotonic', side_effect=self.clock.monotonic))
+        self.sleep = self.enterContext(patch.object(fetch_replays.time, 'sleep', side_effect=self.clock.sleep))
+
+    def client(self, retries=0):
+        client = fetch_replays.Client(pacer=self.pacer, retries=retries)
+        client.opener = Mock()
+        return client
+
+    def test_every_attempt_is_paced_including_pending_polls_and_failure_retries(self):
+        client = self.client(retries=1)
+        times = []
+        responses = [pending_response(retry_after=0), HTTPError(
+            client.url(POLL_URL), 503, 'busy', {'Retry-After': '0'}, BytesIO(b'')),
+            Response(REPLAY_BYTES)]
+
+        def open_request(*args, **kwargs):
+            times.append(self.clock.now)
+            response = responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        client.opener.open.side_effect = open_request
+        with tempfile.TemporaryDirectory() as directory:
+            client.download('/api/v1/matches/x/bundle', Path(directory) / 'replay.part')
+        self.assertEqual(times, [100, 101, 102])
+
+    def test_waiting_peer_rechecks_cooldown_added_during_its_pacing_sleep(self):
+        self.pacer.wait()
+        client = self.client()
+        times = []
+        client.opener.open.side_effect = lambda *args, **kwargs: (
+            times.append(self.clock.now) or Response(b'{}'))
+
+        def sleep(seconds):
+            self.clock.sleep(seconds)
+            if self.sleep.call_count == 1:
+                self.pacer.cooldown(30)
+
+        self.sleep.side_effect = sleep
+        self.assertEqual(client.get_json('/api/v1/ladder'), {})
+        self.assertEqual(times, [131])
+        self.assertEqual(self.sleep.call_args_list, [call(1), call(30)])
+
+    def test_nonterminal_rate_limit_cooldown_is_shared_with_another_client(self):
+        owner, peer = self.client(retries=1), self.client()
+        times = []
+        owner.opener.open.side_effect = [HTTPError(
+            owner.url('/api/v1/ladder'), 429, 'rate limited', {'Retry-After': '5'}, BytesIO(b'')),
+            Response(b'{}')]
+        peer.opener.open.side_effect = lambda *args, **kwargs: (
+            times.append(self.clock.now) or Response(b'{}'))
+
+        def sleep(seconds):
+            until = self.clock.now + seconds
+            if self.sleep.call_count == 1:
+                self.assertEqual(peer.get_json('/api/v1/match-groups'), {})
+            self.clock.now = max(self.clock.now, until)
+
+        self.sleep.side_effect = sleep
+        self.assertEqual(owner.get_json('/api/v1/ladder'), {})
+        self.assertEqual(times, [115])
+        self.assertEqual(self.clock.now, 116)
+
+    def test_exhausted_rate_limit_blocks_other_clients_without_opening(self):
+        owner, peer = self.client(), self.client()
+        owner.opener.open.side_effect = HTTPError(
+            owner.url('/api/v1/ladder'), 429, 'rate limited', {'Retry-After': '5'}, BytesIO(b''))
+        with self.assertRaises(fetch_replays.RateLimitError):
+            owner.get_json('/api/v1/ladder')
+        with self.assertRaises(fetch_replays.RateLimitError) as caught:
+            peer.get_json('/api/v1/match-groups')
+        self.assertEqual(caught.exception.retry_after, 15)
+        peer.opener.open.assert_not_called()
+        self.sleep.assert_not_called()
+
+    def test_shared_cooldown_and_spacing_cannot_extend_pending_deadline(self):
+        self.pacer.cooldown(30)
+        with self.assertRaises(fetch_replays.RateLimitError):
+            self.pacer.wait(deadline=120)
+        self.sleep.assert_not_called()
+        self.clock.now = 131
+        self.pacer.wait()
+        with self.assertRaisesRegex(fetch_replays.FetchError, 'still pending'):
+            self.pacer.wait(deadline=132)
+        self.sleep.assert_not_called()
 
 
 class PendingReplayTests(unittest.TestCase):

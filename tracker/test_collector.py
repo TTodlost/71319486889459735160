@@ -1,8 +1,9 @@
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import collector
 
@@ -59,6 +60,59 @@ class RefreshRecoveryTests(unittest.TestCase):
         self.assertEqual(build.call_args.kwargs['match_ids'], {'new-map'})
         self.assertEqual(build.call_args.kwargs['leaderboard'], sample[2])
 
+    def test_current_replay_workers_share_metadata_request_pacing(self):
+        leader = {'teamId': 'leader', 'name': 'Leader', 'rank': 1, 'rating': 1600}
+        group = {'id': 'series'}
+        matches = [{'id': mid, 'startedAt': '2026-10-15T11:00:00.000Z',
+                    'statistics': {'outcome': 'teamA'}, 'replayUrl': '/bundle/' + mid}
+                   for mid in ('map-a', 'map-b')]
+        detail = {'group': group, 'matches': matches}
+        records = [{'match_id': m['id'], 'sha256': 'previous-checksum'} for m in matches]
+        catalog = MagicMock()
+        catalog.__enter__.return_value = catalog
+        catalog.db.execute.return_value.fetchone.return_value = {
+            'detail_needed': False, 'detail_json': json.dumps(detail)}
+        catalog.replay_records.return_value = records
+        clients = []
+
+        class FakeClient:
+            base_url = 'https://2026a.battlecode.co.uk'
+
+            def __init__(self, **kwargs):
+                self.options = kwargs
+                clients.append(self)
+
+            def get_json(self, *args):
+                raise AssertionError('Cached series detail should be reused.')
+
+        def downloaded(client, record, archive):
+            return archive / (record['match_id'] + '.repl26a'), False
+
+        pacer = object()
+        with TemporaryDirectory() as directory, \
+             patch.object(collector, 'CACHE', Path(directory)), \
+             patch.object(collector, 'RequestPacer', return_value=pacer) as make_pacer, \
+             patch.object(collector, 'Client', FakeClient), \
+             patch.object(collector, 'iter_ladder', return_value=[leader]), \
+             patch.object(collector, 'recent_groups', return_value=[group]), \
+             patch.object(collector, 'Catalog', return_value=catalog), \
+             patch.object(collector, 'download_replay', side_effect=downloaded), \
+             patch.object(collector, 'write_metadata', return_value={'sha256': 'verified', 'bytes': 12}), \
+             patch.object(collector, 'ThreadPoolExecutor', wraps=collector.ThreadPoolExecutor) as pool:
+            archive, match_ids, ladder, meta = collector.collect_current(
+                lambda _: None, datetime(2026, 10, 15, 12, tzinfo=timezone.utc))
+
+        make_pacer.assert_called_once_with()
+        pool.assert_called_once_with(max_workers=2)
+        self.assertEqual(len(clients), 3)
+        self.assertTrue(all(c.options['pacer'] is pacer for c in clients))
+        self.assertTrue(all(c.options['retries'] == 3 for c in clients))
+        self.assertEqual(match_ids, {'map-a', 'map-b'})
+        self.assertEqual(ladder, [leader])
+        self.assertEqual(meta['collection']['series'], 1)
+        self.assertEqual({call.args[0] for call in catalog.mark_downloaded.call_args_list}, match_ids)
+        catalog.store_detail.assert_not_called()
+
     def test_interrupted_restore_is_retried_in_a_fresh_directory(self):
         artifact = {'id': 123, 'created_at': '2026-01-01T12:00:00Z'}
         with TemporaryDirectory() as directory:
@@ -110,10 +164,11 @@ class RefreshRecoveryTests(unittest.TestCase):
                                {'teamId': 'b', 'ratingBefore': None, 'ratingAfter': None}]}
             source = {'groups': [group], 'more': False}
             calls = []
+            clients = []
 
             class FakeClient:
                 def __init__(self, **kwargs):
-                    pass
+                    clients.append(kwargs)
 
                 def get_json(self, endpoint, params):
                     # The public API requires a timestamp_UUID cursor, even
@@ -122,10 +177,15 @@ class RefreshRecoveryTests(unittest.TestCase):
                     calls.append(dict(params))
                     return json.loads(json.dumps(source))
 
+            pacers = [object(), object()]
             with patch.object(collector, 'Client', FakeClient), \
+                 patch.object(collector, 'RequestPacer', side_effect=pacers), \
+                 patch.object(collector, 'ThreadPoolExecutor', wraps=collector.ThreadPoolExecutor) as pool, \
                  patch.object(collector, 'iter_ladder', return_value=[{'teamId': 'a'}]):
                 histories = collector.fetch_histories(archive, '2026-01-01T09:30:00Z', '2026-01-01T11:00:00Z', lambda _: None)
                 self.assertEqual(len(calls), 2)
+                self.assertEqual(len(clients), 3)
+                self.assertTrue(all(c['pacer'] is pacers[0] for c in clients))
                 with self.assertRaisesRegex(ValueError, 'Pending or unresolved'):
                     collector.RatingIndex(histories, '2026-01-01T09:30:00Z', '2026-01-01T11:00:00Z')
                 # Same archive/request bounds; source evidence becomes newer.
@@ -134,6 +194,10 @@ class RefreshRecoveryTests(unittest.TestCase):
                 group['sides'][1].update(ratingBefore=1500, ratingAfter=1480)
                 collector.fetch_histories(archive, '2026-01-01T09:30:00Z', '2026-01-01T11:00:00Z', lambda _: None)
                 self.assertEqual(len(calls), 4)
+                self.assertEqual(len(clients), 6)
+                self.assertTrue(all(c['pacer'] is pacers[1] for c in clients[3:]))
+                self.assertTrue(all(c['retries'] == 3 for c in clients))
+                self.assertTrue(all(call.kwargs == {'max_workers': 2} for call in pool.call_args_list))
                 index = collector.RatingIndex(histories, '2026-01-01T09:30:00Z', '2026-01-01T11:00:00Z')
                 self.assertEqual(index.at('2026-01-01T10:30:00Z')['a']['elo'], 1520)
 
