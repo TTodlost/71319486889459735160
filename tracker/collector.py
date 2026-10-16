@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+import base64
 import hashlib
 import json
 import math
@@ -12,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import uuid
+import zipfile
 
 from replay_extract import decode, ITEMS, CHAMPIONS, ITEM_DESIGNS, CONSUMABLE_DESIGNS
 from rankings import RatingIndex
@@ -65,6 +67,64 @@ def recent_groups(client, team_id, start, end, limit=SERIES_PER_TEAM):
         params['before'] = cursor
 
 
+def has_statistics(match):
+    return (match.get('statistics') or {}).get('outcome') in ('teamA', 'teamB')
+
+
+def has_completed_statistics(match):
+    return (match.get('statistics') or {}).get('outcome') in ('teamA', 'teamB', 'draw')
+
+
+def has_public_result(match):
+    sides = match.get('sides', [])
+    return (match.get('status') == 'finished'
+            and type(match.get('rounds')) is int and match['rounds'] > 0
+            and len(sides) == 2 and {s.get('side') for s in sides} == {'a', 'b'}
+            and {s.get('result') for s in sides} in ({'win', 'loss'}, {'draw'})
+            and all(type(s.get('score')) is int and s['score'] >= 0 for s in sides))
+
+
+def needs_result_refresh(detail):
+    return any(m.get('status') == 'finished' and m.get('replayUrl')
+               and not has_completed_statistics(m) and not has_public_result(m)
+               for m in detail['matches'])
+
+
+def preserve_reconstructed_statistics(previous, refreshed):
+    if previous is None:
+        return
+    cached = {m['id']: m for m in previous['matches']}
+    fields = ('map', 'patchId', 'startedAt', 'rounds', 'status', 'sides')
+    for match in refreshed['matches']:
+        old = cached.get(match['id'])
+        if (old and old.get('statisticsSource') == 'official-replay-engine'
+                and has_completed_statistics(old) and not has_completed_statistics(match)
+                and all(old.get(key) == match.get(key) for key in fields)):
+            match['statistics'] = old['statistics']
+            match['statisticsSource'] = old['statisticsSource']
+
+
+def replay_statistics(path, match):
+    """Use the official engine locally; public bundles need no summary session."""
+    path = Path(path)
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as archive:
+            replay = archive.read('replay.repl26a')
+    else:
+        replay = path.read_bytes()
+    result = subprocess.run(['node', str(ROOT / 'replay_summary.mjs')],
+        input=json.dumps({'replayBase64': base64.b64encode(replay).decode('ascii'), 'match': match}),
+        text=True, capture_output=True, timeout=120)
+    if result.returncode:
+        raise ValueError(f"Replay summary failed for {match['id']}: {result.stderr.strip()[:1000]}")
+    stats = json.loads(result.stdout)
+    if (not isinstance(stats, dict) or stats.get('outcome') not in ('teamA', 'teamB', 'draw')
+            or type(stats.get('round')) is not int or stats['round'] < 1
+            or not isinstance(stats.get('champions'), list) or not stats['champions']):
+        raise ValueError(f"Invalid reconstructed replay summary for {match['id']}.")
+    return stats
+
+
 def collect_current(progress=print, now=None):
     """Fetch current leaders' recent series before considering any old archive."""
     pacer = RequestPacer()
@@ -86,22 +146,28 @@ def collect_current(progress=print, now=None):
     progress(f'Current top {COLLECTION_TOP}: {len(groups)} recent completed series found.')
     archive = CACHE / 'current' / 'archive'
     match_ids = set()
+    details = {}
+    matches = {}
     with Catalog(archive, client.base_url) as catalog:
         for group in groups.values():
             catalog.upsert_group(group)
             row = catalog.db.execute('select detail_json,detail_needed from groups where id=?', (group['id'],)).fetchone()
-            if row['detail_needed'] or not row['detail_json']:
-                detail = client.get_json('/api/v1/match-groups/' + group['id'])
-                if detail.get('group', {}).get('id') != group['id']:
+            detail = json.loads(row['detail_json']) if row['detail_json'] else None
+            if row['detail_needed'] or detail is None or needs_result_refresh(detail):
+                refreshed = client.get_json('/api/v1/match-groups/' + group['id'])
+                if refreshed.get('group', {}).get('id') != group['id']:
                     raise ValueError('Wrong recent series detail response.')
+                preserve_reconstructed_statistics(detail, refreshed)
+                detail = refreshed
                 catalog.store_detail(detail)
-            else:
-                detail = json.loads(row['detail_json'])
+            details[group['id']] = detail
             for match in detail['matches']:
                 if (match.get('startedAt') and start_text <= match['startedAt'] < end_text
-                        and (match.get('statistics') or {}).get('outcome') in ('teamA', 'teamB')
+                        and (has_statistics(match) or not has_completed_statistics(match)
+                             and has_public_result(match))
                         and match.get('replayUrl')):
                     match_ids.add(match['id'])
+                    matches[match['id']] = match
         records = {r['match_id']: r for r in catalog.replay_records() if r['match_id'] in match_ids}
         if len(records) != len(match_ids) or not records:
             raise ValueError('No complete recent replay records were found.')
@@ -111,13 +177,23 @@ def collect_current(progress=print, now=None):
             path, _ = download_replay(c, record, archive)
             public_record = {k: v for k, v in record.items() if k not in ('file_path', 'downloaded', 'error', 'sha256', 'byte_size')}
             metadata = write_metadata(c, public_record, path, expected_sha256=record.get('sha256'))
-            return record['match_id'], path, metadata
+            match = matches[record['match_id']]
+            stats = replay_statistics(path, match) if not has_statistics(match) else None
+            return record['match_id'], path, metadata, stats
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             tasks = [pool.submit(download, r) for r in records.values()]
             try:
                 for number, task in enumerate(as_completed(tasks), 1):
-                    mid, path, metadata = task.result()
+                    mid, path, metadata, stats = task.result()
+                    if stats is not None:
+                        matches[mid]['statistics'] = stats
+                        matches[mid]['statisticsSource'] = 'official-replay-engine'
+                        # Repair each cached series as its maps finish, including
+                        # details previously marked complete without statistics.
+                        catalog.store_detail(details[records[mid]['group_id']])
+                        if stats['outcome'] == 'draw':
+                            match_ids.remove(mid)
                     catalog.mark_downloaded(mid, path, metadata['sha256'], metadata['bytes'])
                     if number % 200 == 0:
                         progress(f'Recent replays downloaded or checked: {number}/{len(records)}.')
@@ -125,6 +201,8 @@ def collect_current(progress=print, now=None):
                 for task in tasks:
                     task.cancel()
                 raise
+        if not match_ids:
+            raise ValueError('No completed replays with decisive outcomes were found.')
     metadata = {'leaderboardUpdatedAt': end_text, 'sampleStartAt': start_text, 'sampleEndAt': end_text,
                 'sampleWindowHours': WINDOW_HOURS, 'collectionTop': COLLECTION_TOP, 'seriesPerTeam': SERIES_PER_TEAM,
                 'collection': {'teamsChecked': len(leaders), 'series': len(groups), 'seriesByTeam': counts},

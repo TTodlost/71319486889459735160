@@ -1,0 +1,49 @@
+{
+  "match": {
+    "id": "2154025b-1c95-4cd1-a120-b3b64232a19a",
+    "rounds": 539,
+    "sides": [
+      {
+        "side": "a",
+        "teamId": "1890540d-1ffc-4847-adbf-d0d08772f268",
+        "teamName": "Intercontinental Fish",
+        "version": null,
+        "result": "win",
+        "score": 1010,
+        "draft": [
+          "8",
+          "4",
+          "3",
+          "0"
+        ],
+        "botError": null,
+        "ratingBefore": null,
+        "ratingAfter": null,
+        "hasLog": false
+      },
+      {
+        "side": "b",
+        "teamId": "a4350547-b7a1-47b1-9031-4f7f084ad0d8",
+        "teamName": "Univardisty of Shingtonwash",
+        "version": null,
+        "result": "loss",
+        "score": 564,
+        "draft": [
+          "4",
+          "3",
+          "10",
+          "8"
+        ],
+        "botError": null,
+        "ratingBefore": null,
+        "ratingAfter": null,
+        "hasLog": false
+      }
+    ],
+    "status": "finished",
+    "map": "rushbait_v2",
+    "startedAt": "2026-10-16T09:50:04.653Z",
+    "finishedAt": "2026-10-16T09:50:08.355Z",
+    "patchId": "0.0.2:02c4624c8c9b8bcaf9d906f407c0b1d932d5b5bce6e8ea7e222e08065dd9cede:1"
+  }
+}

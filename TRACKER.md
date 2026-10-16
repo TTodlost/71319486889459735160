@@ -24,6 +24,18 @@ Each build queries the current leaderboard and recent histories even when the
 archive artifact has not changed. Current replay files and decoded purchases are
 cached between builds; old archive progress cannot block fresh statistics.
 
+Recent match-group responses omit inline statistics. For those matches, the
+collector runs the public replay through the official WebAssembly engine and
+checks the resulting winner, round count, scores and draft against the public
+match record. Independent purchase decoding must still match the engine's final
+inventories and purchase totals before publication. This uses public replay
+bundles and does not need a signed-in summary-download session.
+
+Previously cached series without statistics are repaired in place. Each completed
+map's reconstructed statistics are saved with the catalog, preserving downloaded
+replays. Failed collections retain their cache for the next run and leave the
+previous deployment available.
+
 Replay bundles may be generated asynchronously. The downloader follows the API's
 returned job poll URL and retry delay, with at most 12 polls or 60 seconds of
 waiting before deferring the download. Pending JSON is never saved as a replay.
@@ -69,11 +81,16 @@ workers. HTTP 429 retries wait at least 15, 30, then 60 seconds, honoring longer
 
 ## Local checks
 
-Python 3.11+ and Node 22+; no third-party packages:
+Python 3.11+, Node 22+, and the official `cambc` 2.2.0 package. Engine preparation
+extracts the versioned WebAssembly engines from the CLI without launching it and
+verifies their SHA-256 hashes. Actions installs a hash-pinned official wheel.
 
 ```sh
+python -m pip install cambc==2.2.0
+python tracker/prepare_engine.py
 python -m unittest discover -s tracker -p 'test_*.py' -v
 node tracker/test_static.mjs
+node --test tracker/test_replay_summary.mjs
 python tracker/build_pages.py --outdir .site
 python -m http.server 8766 --directory .site
 ```

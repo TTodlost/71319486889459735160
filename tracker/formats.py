@@ -14,6 +14,7 @@ import zipfile
 MAP_MAGIC = b"w62pam\0\0"
 REPLAY_MAGIC = b"a62per\0\0"
 SUPPORTED_VERSION = (0, 0, 1)
+SUPPORTED_REPLAY_VERSIONS = frozenset((SUPPORTED_VERSION, (0, 0, 2)))
 TERRAIN_WIRE_NAMES = ("bushes", "walls", "holes", "altars")
 
 
@@ -90,6 +91,8 @@ class Action:
     subtype: int | None = None
     values: tuple[int, ...] = ()
     offset: int = field(default=0, compare=False)
+    # v2 adds a draft byte. Keep it opaque until its gameplay meaning is known.
+    draft_metadata: int | None = None
 
     @property
     def kind(self) -> str:
@@ -118,7 +121,7 @@ class Action:
         return out
 
 
-def _read_action(reader: _Reader) -> Action:
+def _read_action(reader: _Reader, version: tuple[int, int, int] = SUPPORTED_VERSION) -> Action:
     start = reader.pos
     tag = reader.u8("replay action tag")
     subtype = None
@@ -134,15 +137,21 @@ def _read_action(reader: _Reader) -> Action:
         fmt = "BII" if subtype == 0 else "BIBIIIIII"
     elif tag == 3:
         reason = reader.u8("replay end-turn reason")
-        if reason >= 2:
+        # 2.2.0 reader 0x140456610 allows reason 2 only for the v2 body.
+        if reason >= (3 if version == (0, 0, 2) else 2):
             raise FormatError("Invalid replay end-turn reason", start + 1)
         return Action(tag, None, (reason,), start)
     elif tag == 4:
         subtype = reader.u8("draft selection subtype")
         design_index = reader.u32("draft selection")
+        # 2.2.0 reader 0x1404566E2-0x140456703: v2 appends one byte,
+        # accepting precisely 0, 1, 2 or 255; legacy records have no byte.
+        metadata = reader.u8("draft metadata") if version == (0, 0, 2) else None
+        if metadata is not None and metadata not in (0, 1, 2, 255):
+            raise FormatError("Invalid draft metadata", reader.pos - 1)
         if subtype != 0 or design_index >= 12:
             raise FormatError("Invalid draft selection", start + 1)
-        return Action(tag, subtype, (design_index,), start)
+        return Action(tag, subtype, (design_index,), start, metadata)
     elif tag == 5:
         return Action(tag, None, (), start)
     else:
@@ -151,30 +160,42 @@ def _read_action(reader: _Reader) -> Action:
     return Action(tag, subtype, tuple(values), start)
 
 
-def parse_actions(data: bytes, count: int, offset: int = 0, *, allow_trailing: bool = False) -> tuple[Action, ...]:
+def parse_actions(data: bytes, count: int, offset: int = 0, *, allow_trailing: bool = False,
+                  version: tuple[int, int, int] = SUPPORTED_VERSION) -> tuple[Action, ...]:
     """Decode exactly count records; reject unknown tags and incomplete payloads."""
     reader = _Reader(data, offset)
+    if version not in SUPPORTED_REPLAY_VERSIONS:
+        raise FormatError("Unsupported replay file version", offset)
     if count < 0 or count > reader.remaining():
         raise FormatError("Invalid replay record count", offset)
-    actions = tuple(_read_action(reader) for _ in range(count))
+    actions = tuple(_read_action(reader, version) for _ in range(count))
     if not allow_trailing and reader.remaining():
         raise FormatError("Malformed replay actions: trailing bytes", reader.pos)
     return actions
 
 
-def dumps_action(action: Action) -> bytes:
+def dumps_action(action: Action, *, version: tuple[int, int, int] = SUPPORTED_VERSION) -> bytes:
     """Serialize one validated action with precisely the original wire widths."""
     tag, subtype, values = action.tag, action.subtype, action.values
+    if version not in SUPPORTED_REPLAY_VERSIONS:
+        raise FormatError("Unsupported replay file version")
+    if action.draft_metadata is not None and (tag != 4 or version != (0, 0, 2)):
+        raise FormatError("Draft metadata requires a v2 draft action")
     if tag == 0 and subtype in _CHAMPION_WIRE:
         prefix = bytes((tag, subtype))
         fmt = _CHAMPION_WIRE[subtype][1]
     elif tag == 2 and isinstance(subtype, int) and 0 <= subtype < 9:
         prefix = bytes((tag, subtype))
         fmt = "BII" if subtype == 0 else "BIBIIIIII"
-    elif tag == 3 and subtype is None and len(values) == 1 and values[0] in (0, 1):
+    elif tag == 3 and subtype is None and len(values) == 1 and values[0] in (range(3) if version == (0, 0, 2) else range(2)):
         return bytes((tag, values[0]))
     elif tag == 4 and subtype == 0 and len(values) == 1 and 0 <= values[0] < 12:
-        return bytes((tag, subtype)) + struct.pack("<I", values[0])
+        suffix = b""
+        if version == (0, 0, 2):
+            if action.draft_metadata not in (0, 1, 2, 255):
+                raise FormatError("Invalid draft metadata")
+            suffix = bytes((action.draft_metadata,))
+        return bytes((tag, subtype)) + struct.pack("<I", values[0]) + suffix
     elif tag == 5 and subtype is None and not values:
         return bytes((tag,))
     else:
@@ -185,8 +206,9 @@ def dumps_action(action: Action) -> bytes:
         raise FormatError(f"Invalid action payload: {exc}") from exc
 
 
-def dumps_actions(actions: tuple[Action, ...] | list[Action]) -> bytes:
-    return b"".join(dumps_action(action) for action in actions)
+def dumps_actions(actions: tuple[Action, ...] | list[Action], *,
+                  version: tuple[int, int, int] = SUPPORTED_VERSION) -> bytes:
+    return b"".join(dumps_action(action, version=version) for action in actions)
 
 @dataclass(frozen=True)
 class BitMask:
@@ -578,15 +600,15 @@ def parse_replay(data: bytes) -> Replay:
     if reader.take(8, "replay header") != REPLAY_MAGIC:
         raise FormatError("Replay magic number did not match")
     file_version = tuple(reader.take(3, "replay version"))
-    if file_version != SUPPORTED_VERSION:
+    if file_version not in SUPPORTED_REPLAY_VERSIONS:
         raise FormatError("Unsupported replay file version", 8)
     engine_version = tuple(reader.take(3, "replay engine version"))
-    if engine_version != SUPPORTED_VERSION:
+    if engine_version not in SUPPORTED_REPLAY_VERSIONS:
         raise FormatError("Unsupported replay engine version", 11)
     map_data = _read_map(reader)
     validate_map(map_data)
     count = reader.u32("replay record count")
-    actions = parse_actions(data, count, reader.pos)
+    actions = parse_actions(data, count, reader.pos, version=file_version)
     return Replay(map_data, actions, file_version, engine_version)
 
 
@@ -604,10 +626,10 @@ def load_replay(path: str | Path) -> Replay:
 
 
 def dumps_replay(replay: Replay) -> bytes:
-    if replay.file_version != SUPPORTED_VERSION or replay.engine_version != SUPPORTED_VERSION:
+    if replay.file_version not in SUPPORTED_REPLAY_VERSIONS or replay.engine_version not in SUPPORTED_REPLAY_VERSIONS:
         raise FormatError("Unsupported replay version")
     return (REPLAY_MAGIC + bytes(replay.file_version) + bytes(replay.engine_version)
             + dumps_map(replay.map) + struct.pack("<I", len(replay.actions))
-            + dumps_actions(replay.actions))
+            + dumps_actions(replay.actions, version=replay.file_version))
 
 
