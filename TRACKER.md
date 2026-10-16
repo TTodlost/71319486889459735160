@@ -24,6 +24,13 @@ Each build queries the current leaderboard and recent histories even when the
 archive artifact has not changed. Current replay files and decoded purchases are
 cached between builds; old archive progress cannot block fresh statistics.
 
+Replay bundles may be generated asynchronously. The downloader follows the API's
+returned job poll URL and retry delay, with at most 12 polls or 60 seconds of
+waiting before deferring the download. Pending JSON is never saved as a replay.
+If the job URL returns 404, it rechecks the original bundle URL once within the
+same retry budget. Invalid responses also share that budget. A persistent HTTP 429
+stops the archive pass while retaining its checkpoint and remaining download queue.
+
 ## Metrics
 
 - **Win rates → By map** compares champion, item and team results across maps.

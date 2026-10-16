@@ -30,6 +30,8 @@ DEFAULT_BASE_URL = "https://2026a.battlecode.co.uk"
 DEFAULT_OUTDIR = Path(__file__).resolve().parents[2] / "replays" / "website"
 REPLAY_MAGIC = b"a62per\0\0"
 MAP_MAGIC = b"w62pam\0\0"
+MAX_PENDING_POLLS = 12
+PENDING_TIMEOUT = 60
 
 
 class FetchError(RuntimeError):
@@ -46,6 +48,29 @@ class RateLimitError(FetchError):
 
 class _RetryableReplayResponse(FetchError):
     """Downloaded bytes failed validation and may be a transient response."""
+
+
+class _PendingReplayResponse(Exception):
+    """The server accepted a bundle job; poll its URL without spending a retry."""
+
+    def __init__(self, poll_url, retry_after):
+        self.poll_url = poll_url
+        self.retry_after = retry_after
+
+
+def _parse_retry_after(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        wait = float(value)
+    except (ValueError, TypeError, OverflowError):
+        if not isinstance(value, str):
+            return None
+        try:
+            wait = parsedate_to_datetime(value).timestamp() - time.time()
+        except (ValueError, TypeError, OverflowError):
+            return None
+    return wait if math.isfinite(wait) else None
 
 
 def identifier(value: str) -> str:
@@ -82,40 +107,62 @@ class Client:
 
     def _retry_delay(self, error, attempt: int) -> float:
         header = error.headers.get("Retry-After") if isinstance(error, HTTPError) else None
-        wait = min(2 ** attempt, 10)
-        if header:
-            try:
-                wait = float(header)
-            except ValueError:
-                try:
-                    wait = parsedate_to_datetime(header).timestamp() - time.time()
-                except (ValueError, TypeError, OverflowError):
-                    pass
-        if not math.isfinite(wait):
-            wait = min(2 ** attempt, 10)
-        return max(0, wait)
+        wait = _parse_retry_after(header)
+        return max(0, min(2 ** attempt, 10) if wait is None else wait)
 
     def _request(self, path, consume):
-        url = self.url(path)
+        original_url = url = self.url(path)
         remaining = self._rate_limit_until - time.monotonic()
         if remaining > 0:
             raise RateLimitError(f"Rate limited; retry after {math.ceil(remaining)} seconds", remaining)
-        for attempt in range(self.retries + 1):
-            pause = self.delay - (time.monotonic() - self.last_request)
+        attempt = pending_polls = 0
+        pending_deadline = None
+        poll_url = None
+        poll_fallback_used = False
+        while attempt <= self.retries:
+            now = time.monotonic()
+            pause = max(0, self.delay - (now - self.last_request))
+            timeout = self.timeout
+            if pending_deadline is not None:
+                remaining = pending_deadline - now
+                if remaining <= pause:
+                    raise FetchError("Replay bundle is still pending; retry later")
+                timeout = min(timeout, remaining - pause)
             if pause > 0:
                 time.sleep(pause)
             self.last_request = time.monotonic()
             try:
                 request = Request(url, headers={"User-Agent": "cambc-replay-fetcher/1.0",
                                                "Accept": "application/json, application/zip, */*"})
-                with self.opener.open(request, timeout=self.timeout) as response:
+                with self.opener.open(request, timeout=timeout) as response:
                     return consume(response)
+            except _PendingReplayResponse as error:
+                now = time.monotonic()
+                if pending_deadline is None:
+                    pending_deadline = now + PENDING_TIMEOUT
+                if (pending_polls >= MAX_PENDING_POLLS
+                        or error.retry_after >= pending_deadline - now):
+                    raise FetchError("Replay bundle is still pending; retry later") from error
+                poll_url = error.poll_url
+                url = original_url if poll_fallback_used else poll_url
+                pending_polls += 1
+                print(f"Replay bundle pending; polling in {error.retry_after:g}s: {url}", file=sys.stderr)
+                time.sleep(error.retry_after)
+                continue
             except HTTPError as error:
                 error.close()
-                if error.code == 429:
+                if (error.code == 404 and url == poll_url and url != original_url
+                        and not poll_fallback_used and attempt < self.retries):
+                    # Some jobs finish even when their advertised poll route returns 404.
+                    poll_fallback_used = True
+                    url = original_url
                     wait = self._retry_delay(error, attempt)
-                    if attempt == self.retries or wait > 60:
-                        self._rate_limit_until = time.monotonic() + wait
+                elif error.code == 429:
+                    wait = self._retry_delay(error, attempt)
+                    retry_until = time.monotonic() + wait
+                    if (attempt == self.retries or wait > 60
+                            or pending_deadline is not None and retry_until >= pending_deadline):
+                        self._rate_limit_until = retry_until
                         raise RateLimitError(
                             f"HTTP 429 for {url}; retry after {math.ceil(wait)} seconds", wait) from error
                 elif error.code not in (500, 502, 503, 504) or attempt == self.retries:
@@ -133,6 +180,9 @@ class Client:
                 if attempt == self.retries:
                     raise FetchError(f"Request failed for {url}: {error}") from error
                 wait = self._retry_delay(error, attempt)
+            if pending_deadline is not None and wait >= pending_deadline - time.monotonic():
+                raise FetchError("Replay bundle is still pending; retry later")
+            attempt += 1
             print(f"Retrying request in {wait:g}s: {url}", file=sys.stderr)
             time.sleep(wait)
         raise AssertionError("unreachable")
@@ -151,6 +201,22 @@ class Client:
 
     def download(self, path, destination):
         def consume(response):
+            if getattr(response, "status", None) == 202:
+                try:
+                    job = json.loads(response.read())
+                except (ValueError, UnicodeError) as error:
+                    raise FetchError("Expected a JSON replay bundle job response (HTTP 202)") from error
+                if (not isinstance(job, dict) or job.get("status") != "pending"
+                        or any(not isinstance(job.get(key), str) or not job[key].strip()
+                               for key in ("jobId", "pollUrl"))):
+                    raise FetchError("Invalid or failed replay bundle job response (HTTP 202)")
+                poll_url = self.url(job["pollUrl"])
+                wait = _parse_retry_after(response.headers.get("Retry-After"))
+                if wait is None or wait < 0:
+                    wait = _parse_retry_after(job.get("retryAfter"))
+                if wait is None or wait < 0:
+                    wait = 5
+                raise _PendingReplayResponse(poll_url, wait)
             expected = response.headers.get("Content-Length")
             if expected is not None:
                 try:

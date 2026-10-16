@@ -97,9 +97,21 @@ class ScriptedClient:
 
 
 class Response(BytesIO):
-    def __init__(self, payload, headers=None):
+    def __init__(self, payload, headers=None, *, status=200):
         super().__init__(payload)
         self.headers = dict(headers or {})
+        self.status = status
+
+
+POLL_URL = f'/api/v1/matches/{MATCH}/bundle?downloadJob=example-job'
+
+
+def pending_response(*, retry_after=5, headers=None, **fields):
+    data = {'status': 'pending', 'jobId': 'example-job', 'pollUrl': POLL_URL,
+            'retryAfter': retry_after}
+    data.update(fields)
+    return Response(json.dumps(data).encode(), {'Content-Type': 'application/json',
+                                              **(headers or {})}, status=202)
 
 
 class ClientTests(unittest.TestCase):
@@ -330,6 +342,335 @@ class ClientTests(unittest.TestCase):
         for source, expected in cases:
             with self.subTest(source=source):
                 self.assertEqual(fetch_replays.parse_source(client, source), expected)
+
+
+class PendingReplayTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix='pending_replay_tests_')
+        self.addCleanup(directory.cleanup)
+        self.outdir = Path(directory.name)
+        self.destination = self.outdir / GROUP / f'{MATCH}.repl26a'
+        self.client = fetch_replays.Client(delay=0, retries=0)
+        self.client.opener = Mock()
+        self.record = {'group_id': GROUP, 'match_id': MATCH,
+                       'replay_url': f'/api/v1/matches/{MATCH}/bundle'}
+
+    def download(self):
+        return fetch_replays.download_replay(self.client, self.record, self.outdir)
+
+    def requested_urls(self):
+        return [args[0].full_url for args, _ in self.client.opener.open.call_args_list]
+
+    def assert_no_files(self):
+        self.assertEqual([path for path in self.outdir.rglob('*') if path.is_file()], [])
+
+    def test_pending_job_polls_returned_url_and_publishes_only_replay(self):
+        bundle = archive_bytes()
+        self.client.opener.open.side_effect = [
+            pending_response(retry_after=9, headers={'Retry-After': '2'}), Response(bundle)]
+
+        def wait(seconds):
+            self.assertEqual(seconds, 2)
+            self.assertFalse(self.destination.exists())
+            self.assertEqual([path.read_bytes() for path in self.outdir.rglob('*.part')], [b''])
+
+        with patch.object(fetch_replays.time, 'sleep', side_effect=wait) as sleep:
+            destination, fresh = self.download()
+        self.assertTrue(fresh)
+        self.assertEqual(destination.read_bytes(), bundle)
+        self.assertEqual(self.requested_urls(), [self.client.url(self.record['replay_url']),
+                                                self.client.url(POLL_URL)])
+        sleep.assert_called_once_with(2)
+        self.assertEqual(list(self.outdir.rglob('*.part')), [])
+
+    def test_repeated_pending_responses_do_not_consume_failure_retries(self):
+        self.client.opener.open.side_effect = [pending_response() for _ in range(3)] + [
+            Response(REPLAY_BYTES)]
+        with patch.object(fetch_replays.time, 'sleep') as sleep:
+            self.download()
+        self.assertEqual(self.destination.read_bytes(), REPLAY_BYTES)
+        self.assertEqual(self.requested_urls(), [self.client.url(self.record['replay_url'])] +
+                         [self.client.url(POLL_URL)] * 3)
+        self.assertEqual(sleep.call_args_list, [call(5)] * 3)
+
+    def test_transient_failures_before_and_during_polls_share_retry_budget(self):
+        self.client.retries = 1
+        self.client.opener.open.side_effect = [
+            HTTPError(self.client.url(self.record['replay_url']), 503, 'busy',
+                      {'Retry-After': '0'}, BytesIO(b'')),
+            pending_response(retry_after=0),
+            HTTPError(self.client.url(POLL_URL), 503, 'busy',
+                      {'Retry-After': '0'}, BytesIO(b'')),
+            Response(REPLAY_BYTES),
+        ]
+        with patch.object(fetch_replays.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(fetch_replays.FetchError, '503'):
+                self.download()
+        self.assertEqual(self.requested_urls(), [self.client.url(self.record['replay_url'])] * 2 +
+                         [self.client.url(POLL_URL)])
+        self.assertEqual(sleep.call_args_list, [call(0), call(0)])
+        self.assert_no_files()
+
+    def test_retry_on_poll_reuses_poll_url_instead_of_starting_another_job(self):
+        self.client.retries = 1
+        self.client.opener.open.side_effect = [pending_response(retry_after=0),
+                                              Response(b'<html>busy</html>'),
+                                              pending_response(retry_after=0), Response(REPLAY_BYTES)]
+        with patch.object(fetch_replays.time, 'sleep') as sleep:
+            self.download()
+        self.assertEqual(self.requested_urls(), [self.client.url(self.record['replay_url'])] +
+                         [self.client.url(POLL_URL)] * 3)
+        self.assertEqual(sleep.call_args_list, [call(0), call(1), call(0)])
+        self.assertEqual(self.destination.read_bytes(), REPLAY_BYTES)
+
+    def test_invalid_or_failed_job_json_is_rejected_without_publication_or_retry(self):
+        for payload in (b'{unfinished', b'[]', b'{"status":"failed","error":"job failed"}',
+                        b'{"status":"pending"}',
+                        b'{"status":"pending","jobId":"","pollUrl":"/poll"}',
+                        b'{"status":"pending","jobId":42,"pollUrl":"/poll"}',
+                        b'{"status":"pending","jobId":"job","pollUrl":null}'):
+            with self.subTest(payload=payload):
+                self.client.retries = 3
+                self.client.opener.open.reset_mock()
+                self.client.opener.open.side_effect = [Response(payload, status=202)]
+                with patch.object(fetch_replays.time, 'sleep') as sleep:
+                    with self.assertRaises(fetch_replays.FetchError):
+                        self.download()
+                self.assertEqual(self.client.opener.open.call_count, 1)
+                sleep.assert_not_called()
+                self.assert_no_files()
+
+    def test_unsafe_poll_urls_are_rejected_before_another_request(self):
+        for poll_url in ('https://other.example/poll', '//other.example/poll',
+                         '/poll#fragment', 'https://user:pass@2026a.battlecode.co.uk/poll', ' '):
+            with self.subTest(poll_url=poll_url):
+                self.client.opener.open.reset_mock()
+                self.client.opener.open.side_effect = [pending_response(pollUrl=poll_url)]
+                with patch.object(fetch_replays.time, 'sleep') as sleep:
+                    with self.assertRaises(fetch_replays.FetchError):
+                        self.download()
+                self.assertEqual(self.client.opener.open.call_count, 1)
+                sleep.assert_not_called()
+                self.assert_no_files()
+
+    def test_poll_delay_uses_valid_header_then_body_then_five_second_fallback(self):
+        for header, body, expected in [(None, 7, 7), ('3', 7, 3), ('invalid', 2, 2),
+                                       (None, None, 5), ('nan', 'inf', 5),
+                                       (None, 'invalid', 5), (None, True, 5),
+                                       (None, {'seconds': 7}, 5), (None, [7], 5),
+                                       ('Thu, 01 Jan 1970 00:00:04 GMT', 7, 4)]:
+            with self.subTest(header=header, body=body):
+                self.destination.unlink(missing_ok=True)
+                self.client.opener.open.reset_mock()
+                headers = {} if header is None else {'Retry-After': header}
+                self.client.opener.open.side_effect = [pending_response(retry_after=body, headers=headers),
+                                                      Response(REPLAY_BYTES)]
+                with patch.object(fetch_replays.time, 'sleep') as sleep, \
+                        patch.object(fetch_replays.time, 'time', return_value=0):
+                    self.download()
+                sleep.assert_called_once_with(expected)
+
+    def test_zero_delay_pending_is_bounded_to_twelve_poll_requests(self):
+        self.client.opener.open.side_effect = lambda *args, **kwargs: pending_response(retry_after=0)
+        with patch.object(fetch_replays.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(fetch_replays.FetchError, 'still pending.*retry later'):
+                self.download()
+        self.assertEqual(self.client.opener.open.call_count, 13)
+        self.assertEqual(sleep.call_args_list, [call(0)] * 12)
+        self.assert_no_files()
+
+    def test_long_pending_delay_defers_without_sleeping_or_another_request(self):
+        self.client.opener.open.side_effect = [pending_response(retry_after=120)]
+        with patch.object(fetch_replays.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(fetch_replays.FetchError, 'still pending.*retry later'):
+                self.download()
+        self.assertEqual(self.client.opener.open.call_count, 1)
+        sleep.assert_not_called()
+        self.assert_no_files()
+
+    def test_pending_waits_share_a_sixty_second_deadline(self):
+        self.client.opener.open.side_effect = [pending_response(retry_after=20),
+                                              pending_response(retry_after=20),
+                                              pending_response(retry_after=21)]
+        now = 100
+
+        def wait(seconds):
+            nonlocal now
+            now += seconds
+
+        with patch.object(fetch_replays.time, 'sleep', side_effect=wait) as sleep, \
+                patch.object(fetch_replays.time, 'monotonic', side_effect=lambda: now):
+            with self.assertRaisesRegex(fetch_replays.FetchError, 'still pending.*retry later'):
+                self.download()
+        self.assertEqual(self.client.opener.open.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(20), call(20)])
+        self.assert_no_files()
+
+    def test_poll_timeout_is_limited_to_remaining_pending_deadline(self):
+        self.client.opener.open.side_effect = [pending_response(retry_after=55), Response(REPLAY_BYTES)]
+        now = 100
+
+        def wait(seconds):
+            nonlocal now
+            now += seconds
+
+        with patch.object(fetch_replays.time, 'sleep', side_effect=wait), \
+                patch.object(fetch_replays.time, 'monotonic', side_effect=lambda: now):
+            self.download()
+        self.assertEqual([kwargs['timeout'] for _, kwargs in self.client.opener.open.call_args_list],
+                         [30, 5])
+
+    def test_poll_failure_backoff_cannot_exceed_pending_deadline(self):
+        self.client.retries = 1
+        self.client.opener.open.side_effect = [pending_response(retry_after=40), HTTPError(
+            self.client.url(POLL_URL), 503, 'busy', {'Retry-After': '21'}, BytesIO(b''))]
+        now = 100
+
+        def wait(seconds):
+            nonlocal now
+            now += seconds
+
+        with patch.object(fetch_replays.time, 'sleep', side_effect=wait) as sleep, \
+                patch.object(fetch_replays.time, 'monotonic', side_effect=lambda: now):
+            with self.assertRaisesRegex(fetch_replays.FetchError, 'still pending.*retry later'):
+                self.download()
+        self.assertEqual(self.client.opener.open.call_count, 2)
+        sleep.assert_called_once_with(40)
+        self.assert_no_files()
+
+    def test_rate_limit_during_polling_preserves_typed_error_and_cleans_temp(self):
+        self.client.opener.open.side_effect = [pending_response(retry_after=0), HTTPError(
+            self.client.url(POLL_URL), 429, 'rate limited', {'Retry-After': '120'}, BytesIO(b''))]
+        with patch.object(fetch_replays.time, 'sleep') as sleep:
+            with self.assertRaises(fetch_replays.RateLimitError) as caught:
+                self.download()
+        self.assertEqual(caught.exception.retry_after, 120)
+        self.assertEqual(self.client.opener.open.call_count, 2)
+        sleep.assert_called_once_with(0)
+        self.assert_no_files()
+
+    def test_rate_limit_beyond_pending_deadline_preserves_cooldown_and_blocks_next_request(self):
+        self.client.retries = 1
+        self.client.opener.open.side_effect = [pending_response(retry_after=40), HTTPError(
+            self.client.url(POLL_URL), 429, 'rate limited', {'Retry-After': '30'}, BytesIO(b''))]
+        now = 100
+
+        def wait(seconds):
+            nonlocal now
+            now += seconds
+
+        with patch.object(fetch_replays.time, 'sleep', side_effect=wait) as sleep, \
+                patch.object(fetch_replays.time, 'monotonic', side_effect=lambda: now):
+            with self.assertRaises(fetch_replays.RateLimitError) as first:
+                self.download()
+            self.assertEqual(first.exception.retry_after, 30)
+            now += 5
+            with self.assertRaises(fetch_replays.RateLimitError) as second:
+                self.client.get_json('/api/v1/ladder')
+            self.assertEqual(second.exception.retry_after, 25)
+        self.assertEqual(self.client.opener.open.call_count, 2)
+        sleep.assert_called_once_with(40)
+        self.assert_no_files()
+
+    def test_missing_poll_job_rechecks_original_url_once_with_shared_retry_budget(self):
+        self.client.retries = 1
+        bundle = archive_bytes()
+        self.client.opener.open.side_effect = [pending_response(retry_after=0), HTTPError(
+            self.client.url(POLL_URL), 404, 'not found', {}, BytesIO(b'{"error":"Not found"}')),
+            Response(bundle)]
+        with patch.object(fetch_replays.time, 'sleep') as sleep:
+            self.download()
+        self.assertEqual(self.requested_urls(), [self.client.url(self.record['replay_url']),
+                                                self.client.url(POLL_URL),
+                                                self.client.url(self.record['replay_url'])])
+        self.assertEqual(sleep.call_args_list, [call(0), call(1)])
+        self.assertEqual(self.destination.read_bytes(), bundle)
+        self.assertEqual(list(self.outdir.rglob('*.part')), [])
+
+    def test_missing_poll_job_fallback_keeps_original_url_after_new_pending_job(self):
+        self.client.retries = 3
+        next_poll = POLL_URL.replace('example-job', 'next-job')
+        self.client.opener.open.side_effect = [pending_response(retry_after=0), HTTPError(
+            self.client.url(POLL_URL), 404, 'not found', {}, BytesIO(b'')),
+            pending_response(retry_after=0, jobId='next-job', pollUrl=next_poll), HTTPError(
+                self.client.url(self.record['replay_url']), 404, 'not found', {}, BytesIO(b'')),
+            Response(REPLAY_BYTES)]
+        with patch.object(fetch_replays.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(fetch_replays.FetchError, '404'):
+                self.download()
+        self.assertEqual(self.requested_urls(), [self.client.url(self.record['replay_url']),
+                                                self.client.url(POLL_URL),
+                                                self.client.url(self.record['replay_url']),
+                                                self.client.url(self.record['replay_url'])])
+        self.assertEqual(sleep.call_args_list, [call(0), call(1), call(0)])
+        self.assert_no_files()
+
+    def test_missing_poll_job_fallback_polls_original_until_same_job_finishes(self):
+        self.client.retries = 1
+        self.client.opener.open.side_effect = [pending_response(), HTTPError(
+            self.client.url(POLL_URL), 404, 'not found', {}, BytesIO(b'')),
+            pending_response(), Response(REPLAY_BYTES)]
+        with patch.object(fetch_replays.time, 'sleep') as sleep:
+            self.download()
+        self.assertEqual(self.requested_urls(), [self.client.url(self.record['replay_url']),
+                                                self.client.url(POLL_URL)] +
+                         [self.client.url(self.record['replay_url'])] * 2)
+        self.assertEqual(sleep.call_args_list, [call(5), call(1), call(5)])
+        self.assertEqual(self.destination.read_bytes(), REPLAY_BYTES)
+        self.assertEqual(list(self.outdir.rglob('*.part')), [])
+
+    def test_missing_poll_job_never_recovers_without_remaining_failure_retry(self):
+        for previous_failure in (False, True):
+            with self.subTest(previous_failure=previous_failure):
+                self.client.retries = int(previous_failure)
+                self.client.opener.open.reset_mock()
+                responses = [HTTPError(self.client.url(self.record['replay_url']), 503, 'busy',
+                                       {'Retry-After': '0'}, BytesIO(b''))] if previous_failure else []
+                self.client.opener.open.side_effect = responses + [pending_response(retry_after=0),
+                    HTTPError(self.client.url(POLL_URL), 404, 'not found', {}, BytesIO(b'')),
+                    Response(REPLAY_BYTES)]
+                with patch.object(fetch_replays.time, 'sleep'):
+                    with self.assertRaisesRegex(fetch_replays.FetchError, '404'):
+                        self.download()
+                self.assertEqual(self.client.opener.open.call_count, 2 + int(previous_failure))
+                self.assert_no_files()
+
+    def test_missing_poll_job_fallback_preserves_pending_deadline(self):
+        self.client.retries = 1
+        self.client.opener.open.side_effect = [pending_response(retry_after=40), HTTPError(
+            self.client.url(POLL_URL), 404, 'not found', {}, BytesIO(b'')), pending_response(retry_after=20)]
+        now = 100
+
+        def wait(seconds):
+            nonlocal now
+            now += seconds
+
+        with patch.object(fetch_replays.time, 'sleep', side_effect=wait) as sleep, \
+                patch.object(fetch_replays.time, 'monotonic', side_effect=lambda: now):
+            with self.assertRaisesRegex(fetch_replays.FetchError, 'still pending.*retry later'):
+                self.download()
+        self.assertEqual(self.client.opener.open.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(40), call(1)])
+        self.assert_no_files()
+
+    def test_missing_poll_job_fallback_preserves_poll_cap(self):
+        self.client.retries = 1
+
+        def response(*args, **kwargs):
+            if self.client.opener.open.call_count == 2:
+                raise HTTPError(self.client.url(POLL_URL), 404, 'not found', {}, BytesIO(b''))
+            return pending_response(retry_after=0)
+
+        self.client.opener.open.side_effect = response
+        with patch.object(fetch_replays.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(fetch_replays.FetchError, 'still pending.*retry later'):
+                self.download()
+        self.assertEqual(self.client.opener.open.call_count, 14)
+        self.assertEqual(self.requested_urls(), [self.client.url(self.record['replay_url']),
+                                                self.client.url(POLL_URL)] +
+                         [self.client.url(self.record['replay_url'])] * 12)
+        self.assertEqual(sleep.call_args_list, [call(0), call(1)] + [call(0)] * 11)
+        self.assert_no_files()
 
 
 class LadderTests(unittest.TestCase):
